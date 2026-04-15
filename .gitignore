@@ -1,0 +1,45 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Persistent session (daily-rotating Kite access token)
+data/session.json
+data/kite_session*
+~/.kite-algo/
+
+# Virtualenv
+.venv/
+venv/
+
+# SQLite audit DBs
+*.sqlite3
+*.sqlite
+
+# Local logs
+logs/
+*.log
+
+# OS / editor
+.idea/
+.vscode/
+
+# Data caches
+data/instruments/
+data/historical/
+data/ticks/
+data/reports/
+ibkr_data_cache/
+kite_data_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Claude
+.claude/

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Project trading rules (CLAUDE.md)
+    url: https://github.com/mahimn01/kite-algo/blob/main/CLAUDE.md
+    about: Daily token rotation, rate limits, product types, market hours. Read this before opening an issue about live order routing.
+  - name: Sister repo — trading-algo (IBKR)
+    url: https://github.com/mahimn01/trading-algo
+    about: Parallel project for IBKR (US equities, crypto, options). Structural issues often apply to both.
