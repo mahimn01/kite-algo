@@ -77,8 +77,18 @@ def load_session(path: Path = DEFAULT_SESSION_PATH) -> dict:
 
 
 def save_session(data: dict, path: Path = DEFAULT_SESSION_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write session with owner-only permissions (the file contains a live
+    access token valid for the rest of the trading day).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Write then chmod. On POSIX the file is created with umask; we immediately
+    # restrict to 0600. On Windows chmod is a no-op but the directory ACLs
+    # should already restrict non-owner access.
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def get_access_token() -> str:

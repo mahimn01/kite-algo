@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import json
 import logging
 import math
 import os
-import signal
 import sys
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -39,11 +40,28 @@ from kite_algo.logging_setup import configure_logging
 from kite_algo.resilience import (
     IdempotentOrderPlacer,
     KiteRateLimiter,
+    RateLimitedKiteClient,
     find_order_by_tag,
     new_order_tag,
     retry_with_backoff,
 )
 from kite_algo.validation import format_errors, validate_order
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip api_secret/access_token from error strings before printing.
+
+    Kite SDK errors occasionally echo request payload fields.
+    """
+    try:
+        cfg = KiteConfig.from_env()
+    except Exception:
+        return text
+    out = text
+    for secret in (cfg.api_secret, cfg.access_token):
+        if secret and len(secret) > 8:
+            out = out.replace(secret, "***REDACTED***")
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -143,16 +161,21 @@ def _emit(data: Any, fmt: str) -> None:
 # -----------------------------------------------------------------------------
 
 def _new_client(require_session: bool = True) -> Any:
+    """Return a rate-limited Kite client.
+
+    Every method call goes through KiteRateLimiter before hitting the API,
+    automatically picking the right bucket (general / historical / orders).
+    """
     KiteConnect = _import_kiteconnect()
     cfg = KiteConfig.from_env()
     if require_session:
         cfg.require_session()
     else:
         cfg.require_credentials()
-    client = KiteConnect(api_key=cfg.api_key)
+    raw = KiteConnect(api_key=cfg.api_key)
     if cfg.access_token:
-        client.set_access_token(cfg.access_token)
-    return client
+        raw.set_access_token(cfg.access_token)
+    return RateLimitedKiteClient(raw, _RATE_LIMITER)
 
 
 # =============================================================================
@@ -174,15 +197,18 @@ def cmd_login(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
-    if args.request_token:
-        request_token = args.request_token
-    else:
-        print(
-            "\nAfter signing in, copy the `request_token` from the redirect URL "
-            "and paste it below.",
-            file=sys.stderr,
-        )
-        request_token = input("request_token: ").strip()
+    # Request token is read via getpass so it never echoes to the terminal
+    # and is not captured in shell history. We also no longer accept it via
+    # a CLI flag (it would appear in /proc/<pid>/cmdline and `ps` output).
+    print(
+        "\nAfter signing in, copy the `request_token` from the redirect URL "
+        "and paste it below (input will not echo).",
+        file=sys.stderr,
+    )
+    try:
+        request_token = getpass.getpass("request_token: ").strip()
+    except EOFError:
+        request_token = ""
 
     if not request_token:
         print("ERROR: empty request_token", file=sys.stderr)
@@ -191,7 +217,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     try:
         data = client.generate_session(request_token, api_secret=cfg.api_secret)
     except Exception as exc:
-        print(f"ERROR: generate_session failed: {exc}", file=sys.stderr)
+        print(f"ERROR: generate_session failed: {_redact_secrets(str(exc))}", file=sys.stderr)
         return 1
 
     session = {
@@ -573,7 +599,14 @@ def cmd_depth(args: argparse.Namespace) -> int:
 
 
 def cmd_stream(args: argparse.Namespace) -> int:
-    """Live WebSocket tick stream via KiteTicker."""
+    """Live WebSocket tick stream via KiteTicker.
+
+    Cross-platform stopping: uses threading.Timer + Event (not SIGALRM
+    which is POSIX-only and re-entrancy-unsafe with Twisted's reactor).
+    Token-related errors set the stop event and cause a non-zero exit
+    (important — tokens rotate at ~6am IST, and we do NOT want a stream
+    to silently emit zero ticks for hours after expiry).
+    """
     KiteTicker = _import_kiteticker()
     cfg = KiteConfig.from_env()
     cfg.require_session()
@@ -592,19 +625,15 @@ def cmd_stream(args: argparse.Namespace) -> int:
             if tok:
                 tokens.append(int(tok))
             else:
-                print(f"WARN: could not resolve token for {sym}", file=sys.stderr)
+                log.warning("could not resolve token for %s", sym)
     if not tokens:
         print("ERROR: no instrument tokens. Use --symbols or --tokens.", file=sys.stderr)
         return 1
 
     mode_map = {"ltp": "ltp", "quote": "quote", "full": "full"}
     subscribe_mode = mode_map.get(args.mode, "full")
+    duration = float(args.duration)
 
-    duration = args.duration
-    start_time = time.time()
-
-    # KiteTicker has built-in reconnection (reconnect=True by default, 50
-    # retries, 60s max delay). We bump tries and expose reconnect callbacks.
     kws = KiteTicker(
         cfg.api_key,
         cfg.access_token,
@@ -613,9 +642,32 @@ def cmd_stream(args: argparse.Namespace) -> int:
         reconnect_max_delay=args.reconnect_max_delay,
     )
 
+    stop_event = threading.Event()
+    exit_code = 0
+
+    def _shutdown(code: int = 0) -> None:
+        nonlocal exit_code
+        exit_code = code
+        stop_event.set()
+        try:
+            kws.close()
+        except Exception as exc:
+            log.debug("ws close raised: %s", exc)
+
+    def _looks_like_token_error(*parts: Any) -> bool:
+        blob = " ".join(str(p) for p in parts).lower()
+        return any(
+            marker in blob
+            for marker in ("token", "401", "403", "invalidaccesstoken", "access token")
+        )
+
     def on_ticks(ws: Any, ticks: list[dict]) -> None:
         for tick in ticks:
-            print(json.dumps(_to_jsonable(tick), default=str), flush=True)
+            try:
+                print(json.dumps(_to_jsonable(tick), default=str), flush=True)
+            except BrokenPipeError:
+                _shutdown(0)
+                return
 
     def on_connect(ws: Any, response: Any) -> None:
         log.info("ws connected — subscribing %d tokens mode=%s", len(tokens), subscribe_mode)
@@ -624,18 +676,31 @@ def cmd_stream(args: argparse.Namespace) -> int:
 
     def on_close(ws: Any, code: Any, reason: Any) -> None:
         log.warning("ws closed: code=%s reason=%s", code, reason)
+        if _looks_like_token_error(code, reason):
+            log.error("token-related close — triggering shutdown (exit 2)")
+            _shutdown(2)
 
     def on_error(ws: Any, code: Any, reason: Any) -> None:
         log.error("ws error: code=%s reason=%s", code, reason)
+        if _looks_like_token_error(code, reason):
+            log.error("token-related error — triggering shutdown (exit 2)")
+            _shutdown(2)
 
     def on_reconnect(ws: Any, attempts: int) -> None:
         log.warning("ws reconnecting (attempt %d)", attempts)
 
     def on_noreconnect(ws: Any) -> None:
         log.error("ws gave up reconnecting after %d tries", args.reconnect_max_tries)
+        _shutdown(2)
 
     def on_order_update(ws: Any, data: dict) -> None:
-        print(json.dumps({"_type": "order_update", **_to_jsonable(data)}, default=str), flush=True)
+        try:
+            print(
+                json.dumps({"_type": "order_update", **_to_jsonable(data)}, default=str),
+                flush=True,
+            )
+        except BrokenPipeError:
+            _shutdown(0)
 
     kws.on_ticks = on_ticks
     kws.on_connect = on_connect
@@ -646,19 +711,34 @@ def cmd_stream(args: argparse.Namespace) -> int:
     if args.order_updates:
         kws.on_order_update = on_order_update
 
-    # Duration-based stop
+    # Duration stop: use a Timer (portable, re-entrancy-safe, supports float).
+    timer: threading.Timer | None = None
     if duration > 0:
-        def _alarm(signum: int, frame: Any) -> None:
-            print(f"\n{duration}s elapsed, disconnecting.", file=sys.stderr)
-            kws.close()
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.alarm(int(duration))
+        def _elapsed() -> None:
+            log.info("%.1fs elapsed — disconnecting", duration)
+            _shutdown(0)
+        timer = threading.Timer(duration, _elapsed)
+        timer.daemon = True
+        timer.start()
 
     try:
-        kws.connect(threaded=False)
+        # threaded=True spawns Twisted in a background thread; the main
+        # thread then waits on the Event.
+        kws.connect(threaded=True)
+        while not stop_event.is_set():
+            if stop_event.wait(timeout=1.0):
+                break
     except KeyboardInterrupt:
-        kws.close()
-    return 0
+        _shutdown(0)
+    finally:
+        if timer:
+            timer.cancel()
+        try:
+            kws.close()
+        except Exception:
+            pass
+
+    return exit_code
 
 
 # =============================================================================
@@ -1102,8 +1182,12 @@ def cmd_place(args: argparse.Namespace) -> int:
         extras["iceberg_quantity"] = args.iceberg_quantity
 
     # --- 3. --dry-run: preview margin + charges, no transmission ------------
+    # Build a margin-calc payload with ONLY the fields order_margins accepts.
+    # This endpoint is read-only — it computes margin requirements without
+    # transmitting. We whitelist fields explicitly and omit price for MARKET
+    # orders (order_margins rejects price=0 with an InputException).
     if args.dry_run:
-        preview_order = {
+        preview_order: dict[str, Any] = {
             "exchange": args.exchange,
             "tradingsymbol": args.tradingsymbol,
             "transaction_type": args.transaction_type,
@@ -1111,14 +1195,21 @@ def cmd_place(args: argparse.Namespace) -> int:
             "product": args.product,
             "order_type": args.order_type,
             "quantity": args.quantity,
-            "price": args.price or 0,
         }
+        if args.order_type in ("LIMIT", "SL") and args.price is not None:
+            preview_order["price"] = args.price
+        if args.order_type in ("SL", "SL-M") and args.trigger_price is not None:
+            preview_order["trigger_price"] = args.trigger_price
+
         try:
             preview = client.order_margins([preview_order])
         except Exception as exc:
-            print(f"ERROR: dry-run margin preview failed: {exc}", file=sys.stderr)
+            print(f"ERROR: dry-run margin preview failed: {_redact_secrets(str(exc))}", file=sys.stderr)
             return 1
-        print("=== DRY RUN — no order transmitted ===", file=sys.stderr)
+        print(
+            "=== DRY RUN — margin preview only. NO order transmitted. ===",
+            file=sys.stderr,
+        )
         _emit(preview, args.format)
         return 0
 
@@ -1166,21 +1257,34 @@ def cmd_place(args: argparse.Namespace) -> int:
 
 
 def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
-    """Poll order_history until order reaches a terminal state or timeout."""
+    """Poll order_history until order reaches a terminal state or timeout.
+
+    Uses exponential backoff (100ms → 1s cap) so fast fills aren't polled
+    slowly. Bails immediately on fatal errors (TokenException,
+    PermissionException).
+    """
     terminal = {"COMPLETE", "REJECTED", "CANCELLED"}
     deadline = time.monotonic() + timeout
     last: dict = {}
+    delay = 0.1
     while time.monotonic() < deadline:
         try:
-            _RATE_LIMITER.wait_general()
             history = client.order_history(order_id) or []
             if history:
+                # Sort chronologically; Kite usually returns ordered but
+                # don't depend on it.
+                history = sorted(history, key=lambda h: h.get("order_timestamp") or "")
                 last = history[-1]
                 if last.get("status") in terminal:
                     return last
         except Exception as exc:
-            log.warning("order_history poll failed: %s", exc)
-        time.sleep(0.5)
+            name = type(exc).__name__
+            if name in ("TokenException", "PermissionException"):
+                log.error("fatal error polling order: %s", _redact_secrets(str(exc)))
+                return last or {"status": "FATAL", "status_message": _redact_secrets(str(exc))}
+            log.warning("order_history poll failed: %s", _redact_secrets(str(exc)))
+        time.sleep(delay)
+        delay = min(1.0, delay * 2)
     return last or {"status": "TIMEOUT"}
 
 
@@ -1212,19 +1316,42 @@ def cmd_modify(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel_all(args: argparse.Namespace) -> int:
+    """Cancel every open / trigger-pending order.
+
+    Rate-limits every cancel through the orders bucket. Reports structured
+    success/failure. Exits non-zero if any cancel failed.
+    """
     _require_yes(args, "cancel ALL open orders")
     client = _new_client()
     orders = client.orders() or []
-    cancelled = []
+    cancelled: list[str] = []
+    failed: list[dict[str, str]] = []
+
     for o in orders:
-        if o.get("status") in ("OPEN", "TRIGGER PENDING"):
-            try:
-                client.cancel_order(variety=o.get("variety", "regular"), order_id=o.get("order_id"))
-                cancelled.append(o.get("order_id"))
-            except Exception as exc:
-                print(f"WARN: failed to cancel {o.get('order_id')}: {exc}", file=sys.stderr)
-    _emit({"cancelled": cancelled, "count": len(cancelled)}, args.format)
-    return 0
+        if o.get("status") not in ("OPEN", "TRIGGER PENDING"):
+            continue
+        order_id = o.get("order_id", "")
+        variety = o.get("variety")
+        if not variety:
+            # Don't guess — surface the inconsistency.
+            failed.append({"order_id": order_id, "reason": "missing variety in orderbook row"})
+            continue
+        try:
+            # client is already rate-limited via RateLimitedKiteClient,
+            # which automatically routes cancel_order through wait_order.
+            client.cancel_order(variety=variety, order_id=order_id)
+            cancelled.append(order_id)
+        except Exception as exc:
+            failed.append({"order_id": order_id, "reason": _redact_secrets(str(exc))[:200]})
+
+    result = {
+        "cancelled": cancelled,
+        "failed": failed,
+        "total_cancelled": len(cancelled),
+        "total_failed": len(failed),
+    }
+    _emit(result, args.format)
+    return 0 if not failed else 1
 
 
 # =============================================================================
@@ -1554,7 +1681,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- auth ---
     s = add("login", cmd_login, "Interactive OAuth login (writes data/session.json)")
-    s.add_argument("--request-token", default=None, help="Skip prompt; use this request_token")
     s.add_argument("--no-browser", action="store_true")
 
     add("profile", cmd_profile, "User profile (verify session)")

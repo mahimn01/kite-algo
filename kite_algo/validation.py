@@ -7,14 +7,30 @@ and produces clearer error messages than the server's InputException.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
-VALID_EXCHANGES = {"NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"}
-VALID_TRANSACTION_TYPES = {"BUY", "SELL"}
-VALID_ORDER_TYPES = {"MARKET", "LIMIT", "SL", "SL-M"}
-VALID_PRODUCTS = {"CNC", "NRML", "MIS", "MTF"}
-VALID_VARIETIES = {"regular", "amo", "co", "iceberg", "auction"}
-VALID_VALIDITIES = {"DAY", "IOC", "TTL"}
+VALID_EXCHANGES = frozenset({"NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"})
+VALID_TRANSACTION_TYPES = frozenset({"BUY", "SELL"})
+VALID_ORDER_TYPES = frozenset({"MARKET", "LIMIT", "SL", "SL-M"})
+VALID_PRODUCTS = frozenset({"CNC", "NRML", "MIS", "MTF"})
+VALID_VARIETIES = frozenset({"regular", "amo", "co", "iceberg", "auction"})
+VALID_VALIDITIES = frozenset({"DAY", "IOC", "TTL"})
+
+# Kite tradingsymbol limits (per exchange docs).
+MAX_TRADINGSYMBOL_LENGTH = 50
+# Kite tag limit.
+MAX_TAG_LENGTH = 20
+# Conservative default cap to catch accidental `--quantity 100000` typos.
+# Override via env KITE_MAX_QUANTITY if you genuinely need larger clip sizes.
+DEFAULT_MAX_QUANTITY = 100_000
+
+
+def _max_quantity() -> int:
+    try:
+        return int(os.getenv("KITE_MAX_QUANTITY", str(DEFAULT_MAX_QUANTITY)))
+    except ValueError:
+        return DEFAULT_MAX_QUANTITY
 
 # Exchanges × product compatibility (per Kite docs).
 # - CNC: equity only (NSE, BSE)
@@ -74,8 +90,18 @@ def validate_order(
     # --- trivial fields ---------------------------------------------------
     if not tradingsymbol or not isinstance(tradingsymbol, str):
         errs.append(ValidationError("tradingsymbol", "required non-empty string"))
+    elif len(tradingsymbol) > MAX_TRADINGSYMBOL_LENGTH:
+        errs.append(ValidationError("tradingsymbol", f"max {MAX_TRADINGSYMBOL_LENGTH} chars"))
+    elif " " in tradingsymbol or not all(c.isalnum() or c in "-_&" for c in tradingsymbol):
+        errs.append(ValidationError("tradingsymbol", "must be alphanumeric (with optional - _ &)"))
+
     if not isinstance(quantity, int) or quantity <= 0:
         errs.append(ValidationError("quantity", "must be a positive int"))
+    elif quantity > _max_quantity():
+        errs.append(ValidationError(
+            "quantity",
+            f"exceeds guardrail {_max_quantity()} (override via env KITE_MAX_QUANTITY)",
+        ))
 
     # --- price/trigger_price rules ---------------------------------------
     if order_type == "LIMIT" and (price is None or price <= 0):
@@ -126,10 +152,14 @@ def validate_order(
             errs.append(ValidationError("disclosed_quantity", "must be > 0 and ≤ quantity"))
 
     # --- tag rules -------------------------------------------------------
+    # Per Kite docs: alphanumeric, max 20 chars. We accept _ and - as common
+    # developer separators; Kite accepts them in practice.
     if tag is not None:
-        if len(tag) > 20:
-            errs.append(ValidationError("tag", "max 20 characters"))
-        if not tag.replace("_", "").replace("-", "").isalnum():
+        if not tag:
+            errs.append(ValidationError("tag", "must not be empty if provided"))
+        elif len(tag) > MAX_TAG_LENGTH:
+            errs.append(ValidationError("tag", f"max {MAX_TAG_LENGTH} characters"))
+        elif not all(c.isalnum() or c in "_-" for c in tag):
             errs.append(ValidationError("tag", "must be alphanumeric (with optional _ or -)"))
 
     return errs

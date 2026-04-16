@@ -216,3 +216,39 @@ class TestQuantityRules:
     def test_negative_quantity_rejected(self) -> None:
         errs = validate_order(**_base(quantity=-5))
         assert any(e.field == "quantity" for e in errs)
+
+    def test_quantity_above_guardrail_rejected(self, monkeypatch) -> None:
+        """Default guardrail 100_000 — catch typos like --quantity 1000000."""
+        monkeypatch.delenv("KITE_MAX_QUANTITY", raising=False)
+        errs = validate_order(**_base(quantity=1_000_000))
+        assert any(e.field == "quantity" and "guardrail" in e.message for e in errs)
+
+    def test_quantity_guardrail_env_override(self, monkeypatch) -> None:
+        """KITE_MAX_QUANTITY env var overrides the default cap."""
+        monkeypatch.setenv("KITE_MAX_QUANTITY", "5000000")
+        errs = validate_order(**_base(quantity=1_000_000))
+        assert errs == []
+
+
+class TestTradingsymbolRules:
+    def test_tradingsymbol_too_long_rejected(self) -> None:
+        errs = validate_order(**_base(tradingsymbol="A" * 51))
+        assert any(e.field == "tradingsymbol" for e in errs)
+
+    def test_tradingsymbol_with_space_rejected(self) -> None:
+        errs = validate_order(**_base(tradingsymbol="RELIANCE LTD"))
+        assert any(e.field == "tradingsymbol" for e in errs)
+
+    def test_tradingsymbol_alphanumeric_with_hyphen_ok(self) -> None:
+        # Government bond: 679GS2031-GS
+        errs = validate_order(**_base(tradingsymbol="679GS2031-GS"))
+        assert errs == []
+
+    def test_tradingsymbol_with_ampersand_ok(self) -> None:
+        # "J&KBANK" is a real NSE symbol
+        errs = validate_order(**_base(tradingsymbol="J&KBANK"))
+        assert errs == []
+
+    def test_tradingsymbol_with_special_char_rejected(self) -> None:
+        errs = validate_order(**_base(tradingsymbol="REL@ANCE"))
+        assert any(e.field == "tradingsymbol" for e in errs)

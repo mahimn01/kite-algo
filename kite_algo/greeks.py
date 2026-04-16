@@ -137,29 +137,54 @@ def implied_vol(
 ) -> float | None:
     """Solve for IV given the observed market price.
 
-    Returns None if the solver fails to converge or the price is below
-    intrinsic (negative extrinsic → no valid IV).
+    Newton-Raphson primary; Brent's method fallback for deep-OTM /
+    low-vega regimes where Newton diverges. Step size is clamped to
+    prevent runaway.
+
+    Returns None if the price is below the risk-free-discounted intrinsic
+    (impossible to price any valid IV) or if both solvers fail.
     """
     if T <= 0:
         return None
+
     is_call = right in ("CE", "C")
-    intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
-    if market_price < intrinsic - 0.01:
+    # Risk-free-discounted intrinsic: for a European option, the price
+    # cannot be below S - K·e^{-rT} (call) or K·e^{-rT} - S (put).
+    discount = math.exp(-r * T)
+    intrinsic_discounted = max(0.0, S - K * discount) if is_call else max(0.0, K * discount - S)
+    if market_price < intrinsic_discounted - 0.01:
         return None
 
-    sigma = 0.30  # initial guess
+    # --- Newton-Raphson with clamped step ---
+    sigma = 0.30
     for _ in range(max_iter):
         price = bs_price(S, K, T, r, sigma, right)
-        d1, _ = _d1d2(S, K, T, r, sigma)
-        vega_raw = S * _norm_pdf(d1) * math.sqrt(T)
-        if vega_raw < 1e-12:
-            break
-        sigma -= (price - market_price) / vega_raw
-        if sigma <= 0.001:
-            sigma = 0.001
         if abs(price - market_price) < tol:
             return sigma
-    return sigma if abs(bs_price(S, K, T, r, sigma, right) - market_price) < tol * 10 else None
+        d1, _ = _d1d2(S, K, T, r, sigma)
+        vega_raw = S * _norm_pdf(d1) * math.sqrt(T)
+        if vega_raw < 1e-10:
+            break  # vega too small, Newton diverges — fall through to Brent
+        # Clamp the step to ±0.5 volatility points to prevent overshoot
+        step = (price - market_price) / vega_raw
+        step = max(-0.5, min(0.5, step))
+        sigma -= step
+        sigma = max(0.001, min(5.0, sigma))
+
+    # --- Brent's method fallback ---
+    try:
+        from scipy.optimize import brentq
+    except ImportError:
+        return None
+
+    def f(s: float) -> float:
+        return bs_price(S, K, T, r, s, right) - market_price
+
+    try:
+        # Bracket IV in [0.001, 5.0]. If f doesn't change sign, Brent fails.
+        return float(brentq(f, 0.001, 5.0, xtol=tol, maxiter=200))
+    except (ValueError, RuntimeError):
+        return None
 
 
 # ---------------------------------------------------------------------------

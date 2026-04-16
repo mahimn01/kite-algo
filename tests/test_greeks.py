@@ -154,6 +154,34 @@ class TestImpliedVol:
         assert iv is not None
         assert 0.10 < iv < 0.25  # realistic NIFTY weekly IV range
 
+    def test_iv_deep_otm_uses_brent_fallback(self) -> None:
+        """Deep OTM weekly — Newton struggles with near-zero vega;
+        Brent fallback should still find a root.
+        """
+        # NIFTY at 24000, strike 27000 (12.5% OTM), 5 DTE, price 0.5
+        S, K, T, r, market = 24000.0, 27000.0, 5 / 365.0, 0.065, 0.50
+        iv = implied_vol(market, S, K, T, r, "CE")
+        assert iv is not None
+        # Deep-OTM weeklies typically show elevated IV
+        assert 0.05 < iv < 1.0
+
+    def test_iv_below_discounted_intrinsic_returns_none(self) -> None:
+        """Price below the risk-free-discounted intrinsic is impossible."""
+        # Deep-ITM call — intrinsic at r=10%, T=1yr: 200 - 100*e^-0.1 ≈ 109.52
+        # Price below that should be rejected.
+        S, K, T, r = 200, 100, 1.0, 0.10
+        iv = implied_vol(90.0, S, K, T, r, "CE")
+        assert iv is None
+
+    def test_iv_stable_across_newton_regime(self) -> None:
+        """Roundtrip should be stable even when Newton clamps heavily."""
+        # Extreme IV — 200% — should still solve
+        S, K, T, r, true_sigma = 100, 100, 0.25, 0.05, 2.00
+        price = bs_price(S, K, T, r, true_sigma, "CE")
+        recovered = implied_vol(price, S, K, T, r, "CE")
+        assert recovered is not None
+        assert abs(recovered - true_sigma) < 1e-3
+
 
 class TestGreeksBundle:
     def test_all_fields_present(self) -> None:

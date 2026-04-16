@@ -56,6 +56,24 @@ def test_session_roundtrip(tmp_path):
     assert loaded["user_id"] == "AB1234"
 
 
+def test_session_file_owner_only_perms(tmp_path):
+    """Access token file must be mode 0600 to prevent local-user leakage."""
+    path = tmp_path / "session.json"
+    save_session({"access_token": "secret"}, path=path)
+    if os.name == "posix":
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o600, f"session file mode is {oct(mode)}, expected 0o600"
+
+
+def test_session_dir_owner_only_perms(tmp_path):
+    """Parent directory should be owner-only too."""
+    path = tmp_path / "subdir" / "session.json"
+    save_session({"access_token": "x"}, path=path)
+    if os.name == "posix":
+        dir_mode = path.parent.stat().st_mode & 0o777
+        assert dir_mode == 0o700, f"session dir mode is {oct(dir_mode)}, expected 0o700"
+
+
 def test_trading_config_dry_run_default(monkeypatch, tmp_path):
     monkeypatch.delenv("TRADING_DRY_RUN", raising=False)
     monkeypatch.delenv("TRADING_ALLOW_LIVE", raising=False)

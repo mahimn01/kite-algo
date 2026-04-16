@@ -252,3 +252,64 @@ class TestStreamParsing:
     def test_invalid_mode_fails(self, parser) -> None:
         with pytest.raises(SystemExit):
             parser.parse_args(["stream", "--mode", "invalid"])
+
+    def test_reconnect_args_exist(self, parser) -> None:
+        args = parser.parse_args([
+            "stream", "--symbols", "NSE:X", "--reconnect-max-tries", "10",
+            "--reconnect-max-delay", "30",
+        ])
+        assert args.reconnect_max_tries == 10
+        assert args.reconnect_max_delay == 30
+
+
+class TestPlaceExtras:
+    def test_dry_run_flag(self, parser) -> None:
+        args = parser.parse_args([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "MARKET",
+            "--quantity", "1", "--product", "CNC", "--dry-run", "--yes",
+        ])
+        assert args.dry_run is True
+
+    def test_wait_for_fill_flag(self, parser) -> None:
+        args = parser.parse_args([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "CNC", "--price", "1300",
+            "--wait-for-fill", "15", "--yes",
+        ])
+        assert args.wait_for_fill == 15
+
+    def test_mtf_product_accepted(self, parser) -> None:
+        args = parser.parse_args([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "MTF", "--price", "1300",
+        ])
+        assert args.product == "MTF"
+
+    def test_auction_variety_accepted(self, parser) -> None:
+        args = parser.parse_args([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "CNC", "--price", "1300",
+            "--variety", "auction",
+        ])
+        assert args.variety == "auction"
+
+    def test_bcd_exchange_accepted(self, parser) -> None:
+        args = parser.parse_args([
+            "place", "--exchange", "BCD", "--tradingsymbol", "USDINR26APRFUT",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "NRML", "--price", "83",
+        ])
+        assert args.exchange == "BCD"
+
+
+class TestLoginFlagRemoved:
+    def test_request_token_flag_is_gone(self, parser) -> None:
+        """Security: --request-token on CLI would appear in ps output + shell
+        history. Must only be read interactively via getpass.
+        """
+        with pytest.raises(SystemExit):
+            parser.parse_args(["login", "--request-token", "ABC123"])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import Mock
 
@@ -10,6 +11,7 @@ import pytest
 from kite_algo.resilience import (
     IdempotentOrderPlacer,
     KiteRateLimiter,
+    RateLimitedKiteClient,
     SlidingWindowLimiter,
     TokenBucket,
     _is_transient_error,
@@ -340,3 +342,173 @@ class TestIdempotentOrderPlacer:
 
         assert order_id == "ORD_SUCCESS"
         assert client.place_order.call_count == 2
+
+    def test_orderbook_propagation_delay(self, monkeypatch) -> None:
+        """Simulates: OMS lag — order isn't in orderbook immediately but
+        appears after a few polls. The placer must poll patiently and NOT
+        retry once it finds the order.
+        """
+        # Speed up the poll delays so the test doesn't take 7s.
+        import kite_algo.resilience as R
+        monkeypatch.setattr(R, "_ORDERBOOK_POLL_DELAYS", (0.01, 0.01, 0.01, 0.01, 0.01))
+
+        client = Mock()
+        NetworkException = type("NetworkException", (Exception,), {})
+
+        captured_tag: list[str] = []
+
+        def place_side_effect(*a, **kw):
+            captured_tag.append(kw["tag"])
+            raise NetworkException("timeout")
+
+        # orders() returns empty for the first 3 calls, then has the order.
+        call_count = {"n": 0}
+        def orders_side_effect():
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return []
+            return [{"order_id": "ORD_LATE", "tag": captured_tag[0], "status": "OPEN"}]
+
+        client.place_order.side_effect = place_side_effect
+        client.orders.side_effect = orders_side_effect
+
+        placer = IdempotentOrderPlacer(client)
+        order_id = placer.place(**self._base_args())
+
+        assert order_id == "ORD_LATE"
+        # Must NOT have retried place_order since we found it via polling
+        assert client.place_order.call_count == 1
+        # Must have polled orders() multiple times
+        assert client.orders.call_count >= 3
+
+    def test_general_exception_is_not_transient(self) -> None:
+        """GeneralException must NOT trigger retry (reviewer finding #9)."""
+        client = Mock()
+        GeneralException = type("GeneralException", (Exception,), {})
+        client.place_order.side_effect = GeneralException("account blocked")
+        placer = IdempotentOrderPlacer(client)
+
+        with pytest.raises(Exception):
+            placer.place(**self._base_args())
+        assert client.place_order.call_count == 1
+        client.orders.assert_not_called()
+
+    def test_keyboard_interrupt_propagates_immediately(self) -> None:
+        """KeyboardInterrupt must not be treated as transient."""
+        client = Mock()
+        client.place_order.side_effect = KeyboardInterrupt()
+        placer = IdempotentOrderPlacer(client)
+
+        with pytest.raises(KeyboardInterrupt):
+            placer.place(**self._base_args())
+        assert client.place_order.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TokenBucket thread-safety
+# ---------------------------------------------------------------------------
+
+class TestTokenBucketThreading:
+    def test_aggregate_rate_under_contention(self) -> None:
+        """10 threads hammering a 50/s bucket should NOT exceed the rate
+        meaningfully over a wall-clock window.
+        """
+        b = TokenBucket(rate_per_sec=50.0, capacity=5)
+        acquisitions: list[float] = []
+        lock = threading.Lock()
+        stop = threading.Event()
+
+        def worker() -> None:
+            while not stop.is_set():
+                b.acquire()
+                with lock:
+                    acquisitions.append(time.monotonic())
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(10)]
+        t0 = time.monotonic()
+        for t in threads:
+            t.start()
+        time.sleep(1.0)  # 1 second test window
+        stop.set()
+        for t in threads:
+            t.join(timeout=2.0)
+        elapsed = time.monotonic() - t0
+
+        # Over 1s at 50/s we should see ~50 + capacity (5) ≈ 55 acquisitions.
+        # Allow generous tolerance for CI variance.
+        count = len(acquisitions)
+        expected_max = int(elapsed * 50 + 10)
+        assert count <= expected_max, f"rate limit violated: {count} in {elapsed:.2f}s (max {expected_max})"
+        assert count >= 30, f"suspiciously low acquisitions: {count} (expected ~50)"
+
+    def test_no_deadlock_on_notify(self) -> None:
+        """If one thread notifies another, no deadlock."""
+        b = TokenBucket(rate_per_sec=100.0, capacity=1)
+
+        # Drain the bucket
+        b.acquire()
+
+        # Start a waiter
+        got = threading.Event()
+        def waiter() -> None:
+            b.acquire()
+            got.set()
+
+        t = threading.Thread(target=waiter, daemon=True)
+        t.start()
+
+        # Wait up to 1s for the refill; at 100/s, refill takes 10ms.
+        assert got.wait(timeout=1.0), "waiter did not progress — possible deadlock"
+
+
+# ---------------------------------------------------------------------------
+# RateLimitedKiteClient
+# ---------------------------------------------------------------------------
+
+class TestRateLimitedKiteClient:
+    def test_delegates_methods(self) -> None:
+        raw = Mock()
+        raw.profile.return_value = {"user_id": "X"}
+        rl = KiteRateLimiter()
+        client = RateLimitedKiteClient(raw, rl)
+        assert client.profile() == {"user_id": "X"}
+        raw.profile.assert_called_once()
+
+    def test_delegates_class_attributes(self) -> None:
+        raw = Mock()
+        raw.GTT_TYPE_SINGLE = "single"
+        raw.GTT_TYPE_OCO = "two-leg"
+        rl = KiteRateLimiter()
+        client = RateLimitedKiteClient(raw, rl)
+        assert client.GTT_TYPE_SINGLE == "single"
+        assert client.GTT_TYPE_OCO == "two-leg"
+
+    def test_order_methods_use_orders_bucket(self) -> None:
+        """place_order should wait on the orders bucket before call."""
+        raw = Mock()
+        raw.place_order.return_value = "ORD_1"
+        rl = KiteRateLimiter()
+
+        bucket_hits = {"order": 0, "general": 0, "historical": 0}
+        def track(name):
+            orig = getattr(rl, name)
+            def wrapper():
+                bucket_hits[name.replace("wait_", "")] += 1
+                return orig()
+            return wrapper
+        rl.wait_order = track("wait_order")
+        rl.wait_general = track("wait_general")
+        rl.wait_historical = track("wait_historical")
+
+        client = RateLimitedKiteClient(raw, rl)
+        client.place_order(variety="regular", tradingsymbol="RELIANCE")
+        client.profile()
+        # historical_data is the only historical-bucket method
+        raw.historical_data.return_value = []
+        client.historical_data(instrument_token=1, from_date=1, to_date=2, interval="day")
+
+        # wait_order is called for place_order, wait_general for profile,
+        # wait_historical for historical_data.
+        assert bucket_hits["order"] == 1
+        assert bucket_hits["historical"] == 1
+        assert bucket_hits["general"] >= 1
