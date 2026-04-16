@@ -1,237 +1,124 @@
-# Kite Algo
+# kite-algo
 
-India-market trading system built on [Kite Connect](https://kite.trade/) (Zerodha). Parallel to [`trading-algo`](https://github.com/mahimn01/trading-algo) (IBKR / US + crypto) but structured for NSE / BSE / NFO / MCX / CDS.
+Indian-market trading system built on Kite Connect (Zerodha). It's the sibling to [trading-algo](https://github.com/mahimn01/trading-algo), which covers US equities and crypto through Interactive Brokers. Same overall design, wired up for NSE, BSE, NFO, MCX, and CDS.
 
-Comprehensive Kite data + operations CLI (`kite_tool`), a broker adapter that matches the `trading-algo` interface, and room to iterate on Indian-market strategies (equity / F&O / commodities).
+Right now it's mostly scaffolding and the read-only side of things. The package structure, safety rails, and data/ops CLI are in place. Order routing, strategies, and the engine loop are stubbed and being filled in.
 
-## Status
-
-**Scaffold — iterating on integration.** The package skeleton, safety rails, and read-only CLI commands are in place. Order routing, strategies, and the engine loop are stubbed and being built out incrementally.
-
-## Quickstart
+## Getting it running
 
 ```bash
-# 1. Install
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Configure
 cp .env.example .env
-# Fill in KITE_API_KEY and KITE_API_SECRET from https://developers.kite.trade/apps
+# fill in KITE_API_KEY and KITE_API_SECRET from https://developers.kite.trade/apps
 
-# 3. Daily login (Kite access tokens rotate at ~6am IST)
 python -m kite_algo.kite_tool login
-
-# 4. Verify
 python -m kite_algo.kite_tool profile
 python -m kite_algo.kite_tool margins
 python -m kite_algo.kite_tool ltp --symbols NSE:RELIANCE,NSE:INFY
 ```
 
-## Architecture
+Every command supports `--format json|csv|table`.
 
-```
-kite-algo/
-├── kite_algo/                       # Core package
-│   ├── cli.py                       # Main trading engine CLI (orders, brackets, safety rails)
-│   ├── kite_tool.py                 # Comprehensive Kite data/ops CLI (auth, quotes, history, orders, GTT, margins)
-│   ├── config.py                    # KiteConfig + TradingConfig with daily-token session management
-│   ├── instruments.py               # InstrumentSpec for NSE / BSE / NFO / MCX / CDS
-│   ├── orders.py                    # Order validation + TradeIntent dataclass
-│   ├── engine.py                    # Polling engine + risk manager
-│   ├── risk.py                      # Position limits + margin checks
-│   ├── oms.py                       # Order manager with state machine
-│   ├── persistence.py               # sqlite audit trail
-│   ├── logging_setup.py
-│   └── broker/
-│       ├── base.py                  # Broker interface (matches trading-algo contract)
-│       ├── kite.py                  # KiteConnect adapter
-│       └── sim.py                   # Deterministic simulation broker for tests/paper
-├── scripts/
-│   ├── login.py                     # Standalone auth helper
-│   └── smoke_test.py                # Connection + read-only sanity checks
-├── tests/
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── SAFETY.md
-│   └── WORKFLOWS.md
-├── data/                            # (gitignored) session.json, instruments cache, historical bars
-├── .github/
-│   ├── PULL_REQUEST_TEMPLATE.md
-│   └── ISSUE_TEMPLATE/
-├── .env.example
-├── CLAUDE.md                        # Project rules (daily token, rate limits, product types)
-├── CHANGELOG.md
-├── requirements.txt
-└── README.md
-```
+## How Kite is different from IBKR
 
-## Kite ↔ IBKR — structural differences
+Coming from the IBKR side, this was the part that surprised me the most. Kite is a different animal.
 
-| Topic | IBKR / `trading-algo` | Kite / `kite-algo` |
-|---|---|---|
-| **Session** | Persistent while TWS / Gateway runs | **Access token rotates at ~6am IST daily.** Manual re-login via OAuth each morning. |
-| **Reporting API** | Flex Web Service → 365-day XML statements | **No Flex equivalent.** Today's `/orders`, `/trades`, `/holdings`, `/positions` from API; historical P&L from Console web UI CSV. |
-| **Live data** | `reqMktData` streams snap + live on one call | **Split**: REST `/quote` for snapshots, **KiteTicker WebSocket** for live stream. |
-| **Greeks** | Delivered by TWS | **Not provided.** Computed locally via Black-Scholes. |
-| **Rate limits** | ~50 req/s | **3 req/s** most endpoints, **10 req/s** `/quote`. |
-| **Instruments** | `reqMatchingSymbols` live | **~70MB CSV** dump refreshed daily ~8:30am IST; grepped locally. |
-| **Market hours** | US 09:30–16:00 ET, crypto 24/7 | NSE 09:15–15:30 IST, MCX 09:00–23:30 IST, CDS 09:00–17:00 IST |
-| **Product types** | Margin vs cash accounts | `CNC` (delivery), `MIS` (intraday, auto-square-off 15:20), `NRML` (F&O carry) |
-| **Order variety** | MKT / LMT / STP / STPLMT / bracket | `regular`, `amo`, `co`, `iceberg`, GTT |
+Sessions don't persist. The access token rotates at roughly 6 AM IST every single morning, and there's no refresh token flow. You have to re-login each day through Kite's OAuth (browser sign-in, 2FA, paste the `request_token` back into the CLI). I looked into automating it with Selenium and TOTP and decided it wasn't worth it. Storing TOTP secrets defeats the point of 2FA and Zerodha actively discourages browser automation.
 
-## `kite_tool` — CLI command catalog
+There's no Flex equivalent. IBKR's Flex Web Service gives you 365 days of XML statements on demand. Kite doesn't have anything like that. You pull today's orders, trades, holdings, and positions from the API, and anything historical has to come from the Console web UI as CSV exports.
 
-All commands support `--format json|csv|table`. Examples assume the `.env` has a valid session (run `login` first each morning).
+Live data is split. You use the REST `/quote` endpoint for snapshots and the KiteTicker WebSocket for streaming. IBKR bundles both into one call.
 
-### Auth / session
+No greeks from the API. If you want them you compute them locally with Black-Scholes.
 
-| Command | Description |
-|---|---|
-| `login` | Interactive OAuth: opens login URL → paste `request_token` → exchanges for `access_token` → writes `data/session.json` |
-| `profile` | User profile (name, email, user id, broker) |
-| `session` | Current session validity + expiry countdown |
-| `logout` | Invalidates access token on the server |
+Rate limits are tight. Around 3 requests per second on most endpoints, 10 per second on `/quote`. IBKR will let you hammer it at roughly 50 per second.
+
+Instruments come as a 70 MB CSV dump refreshed daily around 8:30 AM IST. You grep it locally instead of using a live lookup. Clunky but it works.
+
+Product types matter in a way they don't on IBKR. `CNC` is delivery (longer-term). `MIS` is intraday and auto-squares-off at 15:20. `NRML` is for F&O carry. Mixing these up will cost you real money.
+
+Market hours are different too. NSE is 09:15 to 15:30 IST. MCX runs 09:00 to 23:30 IST. CDS is 09:00 to 17:00 IST.
+
+## The kite_tool CLI
+
+`kite_tool` handles the data and operations side of things.
+
+### Auth and session
+
+`login`, `profile`, `session`, `logout`.
 
 ### Account
 
-| Command | Description |
-|---|---|
-| `margins [--segment equity\|commodity]` | Cash / margin breakdown |
-| `holdings` | Demat holdings (long-term) |
-| `positions` | Day + net intraday positions |
-| `orders` | Today's orders |
-| `trades` | Today's executed trades |
-| `order-history --order-id N` | Full state history for one order |
-| `order-trades --order-id N` | Fills for one order |
+`margins`, `holdings`, `positions`, `orders`, `trades`, `order-history`, `order-trades`.
 
-### Quotes / live data
+### Quotes and live data
 
-| Command | Description |
-|---|---|
-| `ltp --symbols NSE:RELIANCE,NSE:INFY` | Last traded price (fastest, up to 500 symbols) |
-| `ohlc --symbols ...` | OHLC + LTP |
-| `quote --symbols ...` | Full quote: OHLC, depth (5 levels), OI, LTQ, volume, avg price |
-| `stream --symbols ...` | Live WebSocket tick stream (KiteTicker) |
+`ltp` (fastest, up to 500 symbols at once), `ohlc`, `quote` (full depth plus open interest and volume), `stream` (KiteTicker WebSocket tick feed).
 
 ### Historical
 
-| Command | Description |
-|---|---|
-| `history --symbol NSE:RELIANCE --interval day --days 30` | OHLC bars (minute / 3minute / 5minute / 10minute / 15minute / 30minute / 60minute / day) |
-| `instruments --exchange NSE [--dump] [--refresh]` | Instruments CSV dump (cached locally with TTL) |
-| `search --query RELIANCE` | Local grep against cached instruments dump |
+`history` (OHLC bars at minute through day intervals), `instruments` (cached CSV dump), `search` (local grep against the cached instruments file).
 
 ### Options
 
-| Command | Description |
-|---|---|
-| `chain --symbol NIFTY --expiry 2026-05-29` | Full option chain with LTP / OI / volume + locally computed Greeks |
-| `option-quote --symbol NIFTY --expiry 2026-05-29 --strike 24000 --right CE` | Single option quote with Greeks |
-| `expiries --symbol NIFTY` | All listed expiries for an underlying |
+`chain` (full option chain with locally computed Greeks), `option-quote`, `expiries`.
 
-### Orders (gated by safety rails)
+### Orders (safety-gated)
 
-| Command | Description |
-|---|---|
-| `place` | Place a single order (requires `--yes` + token) |
-| `cancel --order-id N` | Cancel one order |
-| `modify --order-id N ...` | Modify quantity / price |
-| `cancel-all` | Cancel all open orders |
+`place`, `cancel`, `modify`, `cancel-all`. All order-placing commands need `--yes` and a confirmation token.
 
 ### GTT (Good Till Triggered)
 
-| Command | Description |
-|---|---|
-| `gtt-list` | All active GTTs |
-| `gtt-get --trigger-id N` | Single GTT details |
-| `gtt-create --symbol ... --trigger-price ... --last-price ... --orders ...` | Create single or OCO GTT |
-| `gtt-modify --trigger-id N ...` | Modify a GTT |
-| `gtt-delete --trigger-id N` | Delete |
+`gtt-list`, `gtt-get`, `gtt-create`, `gtt-modify`, `gtt-delete`. Supports single and OCO orders.
 
-### F&O margin calculator
+### Margin calculator
 
-| Command | Description |
-|---|---|
-| `margin-calc --orders ...` | Pre-trade margin for a list of legs |
-| `basket-margin --orders ...` | Margin benefit for a multi-leg basket |
+`margin-calc` for a list of legs, `basket-margin` for multi-leg benefit calculations.
 
 ### Mutual funds
 
-| Command | Description |
-|---|---|
-| `mf-holdings` | Current MF holdings |
-| `mf-orders` | MF orders |
-| `mf-sips` | Active SIPs |
+`mf-holdings`, `mf-orders`, `mf-sips`.
 
 ## Safety rails
 
-The same multi-layer guard pattern from `trading-algo`:
+Same layered pattern as trading-algo. `TRADING_ALLOW_LIVE` has to be true for any live command to run. `TRADING_LIVE_ENABLED` is a second gate. `TRADING_DRY_RUN` defaults to true and stages orders without transmitting. Every order-placing CLI command needs `--yes`. The broker calls (`place_order`, `modify_order`, `cancel_order`) prompt for `YES` at the terminal. `TRADING_ORDER_TOKEN` is an extra confirmation that has to match a `--confirm-token` passed in. There's an optional sqlite audit trail at `TRADING_DB_PATH`.
 
-| Guard | Description |
-|---|---|
-| `TRADING_ALLOW_LIVE` | Must be `true` to allow any live-trading commands |
-| `TRADING_LIVE_ENABLED` | Second gate, must be explicit |
-| `TRADING_DRY_RUN` | Defaults to `true`; stage orders only, never transmit |
-| `--yes` flag | Every order-placing CLI command requires it |
-| Interactive confirmation | `place_order`, `modify_order`, `cancel_order` prompt for `YES` at the terminal |
-| `TRADING_ORDER_TOKEN` | Second confirmation token required alongside `--confirm-token` |
-| Sqlite audit trail | Optional, configured via `TRADING_DB_PATH` |
+The full safety model lives in `docs/SAFETY.md`.
 
-See `docs/SAFETY.md` for the full safety model.
+## The daily auth flow, in detail
 
-## Daily authentication flow
+Kite's access token expires around 6 AM IST every morning. No exceptions. No refresh tokens. Here's what actually happens.
 
-Kite's access token expires at ~6am IST every morning — no exceptions, no refresh tokens. Auth flow:
+You run `python -m kite_algo.kite_tool login`. The CLI opens the Kite login URL (`https://kite.zerodha.com/connect/login?v=3&api_key=...`) in your browser. You sign in with your Zerodha credentials and 2FA. Kite redirects to your configured `redirect_uri` with a `request_token` in the query string. You paste the `request_token` back into the CLI (or the CLI auto-catches it if you've got a local HTTP listener wired in). The CLI exchanges `request_token` plus `api_secret` for an `access_token`. That `access_token` gets written to `data/session.json` (gitignored). Every command after that reads the token from there.
 
-1. You run `python -m kite_algo.kite_tool login`
-2. CLI opens the Kite login URL (`https://kite.zerodha.com/connect/login?v=3&api_key=...`) in your browser
-3. You sign in with your Zerodha credentials + 2FA
-4. Kite redirects to your configured `redirect_uri` with a `request_token` in the query string
-5. You paste the `request_token` back into the CLI (or the CLI auto-catches it if running a local HTTP listener — optional)
-6. CLI exchanges `request_token` + `api_secret` → `access_token`
-7. `access_token` is written to `data/session.json` (gitignored)
-8. All subsequent commands read the token from the session file
+Don't try to automate this with Selenium and TOTP. It's fragile, it defeats 2FA, and Zerodha really doesn't like it.
 
-**Do not** try to automate this with Selenium/TOTP. It's fragile, storing TOTP secrets defeats the point of 2FA, and Zerodha actively discourages it.
+## Env vars
 
-## Environment variables
-
-See `.env.example` for the full list. Minimum required:
+See `.env.example` for the full list. Minimum to get going.
 
 ```bash
 KITE_API_KEY=your_api_key
 KITE_API_SECRET=your_api_secret
 
 TRADING_BROKER=kite
-TRADING_ALLOW_LIVE=false  # start here
-TRADING_DRY_RUN=true      # start here
+TRADING_ALLOW_LIVE=false
+TRADING_DRY_RUN=true
 ```
 
-## Development status
+Start with `ALLOW_LIVE=false` and `DRY_RUN=true` until you're sure everything behaves.
 
-| Component | Status |
-|---|---|
-| Package skeleton + config | ✅ scaffolded |
-| `kite_tool` CLI parser | ✅ scaffolded |
-| Auth / login flow | 🚧 implementation pending |
-| Read-only commands (profile, margins, holdings, quotes, history) | 🚧 implementation pending |
-| `KiteBroker` adapter | 🚧 stub |
-| Order placement commands | 🚧 stub (safety-gated) |
-| GTT commands | 🚧 stub |
-| WebSocket streaming (`stream`) | 🚧 stub |
-| Options chain + local Greeks | 🚧 stub |
-| Engine / OMS / risk loop | 🚧 stub |
-| Strategies | 🔲 planned |
-| Instruments cache | 🔲 planned |
-| Backtesting | 🔲 planned |
-| Tests | 🔲 planned |
+## Where things stand
 
-See `CHANGELOG.md` for commit history.
+Package skeleton and config are scaffolded. `kite_tool` CLI parser is up. Auth and login, read-only commands (profile, margins, holdings, quotes, history), the KiteBroker adapter, order placement, GTT, WebSocket streaming, options chain with local Greeks, and the engine/OMS/risk loop are all in various states of stub or implementation-in-progress. Strategies, instruments caching, backtesting, and tests are planned but not started.
+
+Commit history is in `CHANGELOG.md`.
 
 ## Related
 
-- [`trading-algo`](https://github.com/mahimn01/trading-algo) — parallel repo for IBKR (US equities, crypto, options)
+- [trading-algo](https://github.com/mahimn01/trading-algo), the IBKR sibling (US equities, crypto, options)
 - [Kite Connect API docs](https://kite.trade/docs/connect/v3/)
-- [pykiteconnect](https://github.com/zerodha/pykiteconnect) — official Python SDK
+- [pykiteconnect](https://github.com/zerodha/pykiteconnect), the official Python SDK
