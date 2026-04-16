@@ -264,22 +264,6 @@ def cmd_holdings(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_authorise_holdings(args: argparse.Namespace) -> int:
-    """Authorise holdings for T1 sell (DDPI/TPIN flow)."""
-    client = _new_client()
-    isins = [s.strip() for s in args.isins.split(",") if s.strip()]
-    if not isins:
-        print("ERROR: --isins required (comma-separated ISINs)", file=sys.stderr)
-        return 1
-    try:
-        data = client.authorise(isins)
-    except Exception as exc:
-        print(f"ERROR: authorise failed: {exc}", file=sys.stderr)
-        return 1
-    _emit(data, args.format)
-    return 0
-
-
 def cmd_positions(args: argparse.Namespace) -> int:
     client = _new_client()
     data = client.positions() or {}
@@ -1225,21 +1209,43 @@ def cmd_basket_margin(args: argparse.Namespace) -> int:
 # MUTUAL FUNDS
 # =============================================================================
 
+def _mf_subscription_hint() -> str:
+    return (
+        "Mutual fund API requires a separate Kite Connect MF subscription. "
+        "Enable at https://kite.zerodha.com/connect/apps (MF add-on)."
+    )
+
+
 def cmd_mf_holdings(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.mf_holdings(), args.format)
+    try:
+        _emit(client.mf_holdings(), args.format)
+    except Exception as exc:
+        print(f"ERROR: mf_holdings failed: {exc}", file=sys.stderr)
+        print(_mf_subscription_hint(), file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_mf_orders(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.mf_orders(), args.format)
+    try:
+        _emit(client.mf_orders(), args.format)
+    except Exception as exc:
+        print(f"ERROR: mf_orders failed: {exc}", file=sys.stderr)
+        print(_mf_subscription_hint(), file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_mf_sips(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.mf_sips(), args.format)
+    try:
+        _emit(client.mf_sips(), args.format)
+    except Exception as exc:
+        print(f"ERROR: mf_sips failed: {exc}", file=sys.stderr)
+        print(_mf_subscription_hint(), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1372,9 +1378,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--segment", choices=["equity", "commodity"], default=None)
 
     s = add("holdings", cmd_holdings, "Demat holdings")
-
-    s = add("authorise-holdings", cmd_authorise_holdings, "Authorise T1 holdings for selling (DDPI)")
-    s.add_argument("--isins", required=True, help="Comma-separated ISINs to authorise")
 
     s = add("positions", cmd_positions, "Day or net positions")
     s.add_argument("--which", choices=["net", "day"], default="net")
