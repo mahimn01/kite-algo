@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import signal
@@ -34,6 +35,15 @@ from kite_algo.config import (
     load_session,
     save_session,
 )
+from kite_algo.logging_setup import configure_logging
+from kite_algo.resilience import (
+    IdempotentOrderPlacer,
+    KiteRateLimiter,
+    find_order_by_tag,
+    new_order_tag,
+    retry_with_backoff,
+)
+from kite_algo.validation import format_errors, validate_order
 
 
 # -----------------------------------------------------------------------------
@@ -41,6 +51,10 @@ from kite_algo.config import (
 # -----------------------------------------------------------------------------
 
 load_dotenv()
+configure_logging(level=logging.INFO if os.getenv("KITE_DEBUG") else logging.WARNING)
+log = logging.getLogger("kite_tool")
+
+_RATE_LIMITER = KiteRateLimiter()
 
 
 def _import_kiteconnect() -> Any:
@@ -230,6 +244,71 @@ def cmd_session(args: argparse.Namespace) -> int:
     }
     _emit(out, args.format)
     return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    """End-to-end health check: session, profile, margins, market data.
+
+    Exits 0 if all checks pass, 1 if any fail. Useful for monitoring and
+    pre-trade verification.
+    """
+    checks: list[dict[str, Any]] = []
+    overall_ok = True
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal overall_ok
+        if not ok:
+            overall_ok = False
+        checks.append({"check": name, "ok": ok, "detail": detail[:100]})
+
+    # 1. Session file present
+    sess = load_session()
+    record("session_file", bool(sess), DEFAULT_SESSION_PATH.name if sess else "missing — run `login`")
+
+    if not sess:
+        _emit(checks, args.format)
+        return 1
+
+    # 2. Credentials in env
+    cfg = KiteConfig.from_env()
+    record("credentials", bool(cfg.api_key and cfg.api_secret), "api_key+secret present" if cfg.api_key else "missing")
+
+    # 3. API reachable + session valid
+    try:
+        client = _new_client()
+        profile = client.profile()
+        record("api_reachable", True, f"user={profile.get('user_id')}")
+    except Exception as exc:
+        record("api_reachable", False, f"{type(exc).__name__}: {exc}")
+        _emit(checks, args.format)
+        return 1
+
+    # 4. Margins endpoint
+    try:
+        margins = client.margins(segment="equity")
+        avail = margins.get("net", 0)
+        record("margins", True, f"equity net ₹{avail:,.0f}")
+    except Exception as exc:
+        record("margins", False, f"{type(exc).__name__}: {exc}")
+
+    # 5. Market data endpoint (LTP)
+    try:
+        quote = client.ltp(["NSE:RELIANCE"])
+        reliance = (quote or {}).get("NSE:RELIANCE", {})
+        ltp = reliance.get("last_price")
+        record("market_data", bool(ltp), f"RELIANCE LTP {ltp}")
+    except Exception as exc:
+        record("market_data", False, f"{type(exc).__name__}: {exc}")
+
+    # 6. Instruments cache
+    try:
+        path = _instruments_cache_path("NSE")
+        record("instruments_cache", path.exists(), str(path))
+    except Exception as exc:
+        record("instruments_cache", False, str(exc))
+
+    _emit(checks, args.format)
+    return 0 if overall_ok else 1
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
@@ -524,22 +603,36 @@ def cmd_stream(args: argparse.Namespace) -> int:
     duration = args.duration
     start_time = time.time()
 
-    kws = KiteTicker(cfg.api_key, cfg.access_token)
+    # KiteTicker has built-in reconnection (reconnect=True by default, 50
+    # retries, 60s max delay). We bump tries and expose reconnect callbacks.
+    kws = KiteTicker(
+        cfg.api_key,
+        cfg.access_token,
+        reconnect=True,
+        reconnect_max_tries=args.reconnect_max_tries,
+        reconnect_max_delay=args.reconnect_max_delay,
+    )
 
     def on_ticks(ws: Any, ticks: list[dict]) -> None:
         for tick in ticks:
             print(json.dumps(_to_jsonable(tick), default=str), flush=True)
 
     def on_connect(ws: Any, response: Any) -> None:
-        print(f"connected, subscribing {len(tokens)} tokens in mode={subscribe_mode}", file=sys.stderr)
+        log.info("ws connected — subscribing %d tokens mode=%s", len(tokens), subscribe_mode)
         ws.subscribe(tokens)
         ws.set_mode(subscribe_mode, tokens)
 
     def on_close(ws: Any, code: Any, reason: Any) -> None:
-        print(f"ws closed: code={code} reason={reason}", file=sys.stderr)
+        log.warning("ws closed: code=%s reason=%s", code, reason)
 
     def on_error(ws: Any, code: Any, reason: Any) -> None:
-        print(f"ws error: code={code} reason={reason}", file=sys.stderr)
+        log.error("ws error: code=%s reason=%s", code, reason)
+
+    def on_reconnect(ws: Any, attempts: int) -> None:
+        log.warning("ws reconnecting (attempt %d)", attempts)
+
+    def on_noreconnect(ws: Any) -> None:
+        log.error("ws gave up reconnecting after %d tries", args.reconnect_max_tries)
 
     def on_order_update(ws: Any, data: dict) -> None:
         print(json.dumps({"_type": "order_update", **_to_jsonable(data)}, default=str), flush=True)
@@ -548,6 +641,8 @@ def cmd_stream(args: argparse.Namespace) -> int:
     kws.on_connect = on_connect
     kws.on_close = on_close
     kws.on_error = on_error
+    kws.on_reconnect = on_reconnect
+    kws.on_noreconnect = on_noreconnect
     if args.order_updates:
         kws.on_order_update = on_order_update
 
@@ -954,46 +1049,139 @@ def _require_yes(args: argparse.Namespace, action: str) -> None:
 
 
 def cmd_place(args: argparse.Namespace) -> int:
-    """Place a single order via Kite Connect."""
+    """Place a single order via Kite Connect.
+
+    Pipeline:
+      1. Pre-flight validation (local — no API call).
+      2. --dry-run: skip to order_margins() preview and return.
+      3. Auto-generate tag if not provided (for idempotent retry).
+      4. IdempotentOrderPlacer: rate-limit, place, check orderbook on transient failure.
+      5. --wait-for-fill: poll order_history until COMPLETE / REJECTED / CANCELLED.
+    """
     _require_yes(args, "place an order")
+
+    # --- 1. Pre-flight validation -------------------------------------------
+    errors = validate_order(
+        exchange=args.exchange,
+        tradingsymbol=args.tradingsymbol,
+        transaction_type=args.transaction_type,
+        order_type=args.order_type,
+        quantity=args.quantity,
+        product=args.product,
+        variety=args.variety,
+        price=args.price,
+        trigger_price=args.trigger_price,
+        validity=args.validity,
+        validity_ttl=args.validity_ttl,
+        disclosed_quantity=args.disclosed_quantity,
+        iceberg_legs=args.iceberg_legs,
+        iceberg_quantity=args.iceberg_quantity,
+        tag=args.tag,
+    )
+    if errors:
+        print(format_errors(errors), file=sys.stderr)
+        return 1
+
     client = _new_client()
 
-    kwargs: dict[str, Any] = {
-        "variety": args.variety,
+    # --- 2. Build payload ---------------------------------------------------
+    extras: dict[str, Any] = {}
+    if args.price is not None:
+        extras["price"] = args.price
+    if args.trigger_price is not None:
+        extras["trigger_price"] = args.trigger_price
+    if args.disclosed_quantity is not None:
+        extras["disclosed_quantity"] = args.disclosed_quantity
+    if args.validity:
+        extras["validity"] = args.validity
+    if args.validity_ttl is not None:
+        extras["validity_ttl"] = args.validity_ttl
+    if args.iceberg_legs is not None:
+        extras["iceberg_legs"] = args.iceberg_legs
+    if args.iceberg_quantity is not None:
+        extras["iceberg_quantity"] = args.iceberg_quantity
+
+    # --- 3. --dry-run: preview margin + charges, no transmission ------------
+    if args.dry_run:
+        preview_order = {
+            "exchange": args.exchange,
+            "tradingsymbol": args.tradingsymbol,
+            "transaction_type": args.transaction_type,
+            "variety": args.variety,
+            "product": args.product,
+            "order_type": args.order_type,
+            "quantity": args.quantity,
+            "price": args.price or 0,
+        }
+        try:
+            preview = client.order_margins([preview_order])
+        except Exception as exc:
+            print(f"ERROR: dry-run margin preview failed: {exc}", file=sys.stderr)
+            return 1
+        print("=== DRY RUN — no order transmitted ===", file=sys.stderr)
+        _emit(preview, args.format)
+        return 0
+
+    # --- 4. Idempotent placement -------------------------------------------
+    tag = args.tag or new_order_tag()
+    placer = IdempotentOrderPlacer(client, rate_limiter=_RATE_LIMITER)
+    try:
+        order_id = placer.place(
+            variety=args.variety,
+            exchange=args.exchange,
+            tradingsymbol=args.tradingsymbol,
+            transaction_type=args.transaction_type,
+            quantity=args.quantity,
+            product=args.product,
+            order_type=args.order_type,
+            tag=tag,
+            **extras,
+        )
+    except Exception as exc:
+        print(f"ERROR: place_order failed: {exc}", file=sys.stderr)
+        return 1
+
+    result: dict[str, Any] = {
+        "order_id": order_id,
+        "tag": tag,
         "exchange": args.exchange,
         "tradingsymbol": args.tradingsymbol,
         "transaction_type": args.transaction_type,
         "quantity": args.quantity,
         "product": args.product,
         "order_type": args.order_type,
+        **extras,
     }
 
-    if args.price is not None:
-        kwargs["price"] = args.price
-    if args.trigger_price is not None:
-        kwargs["trigger_price"] = args.trigger_price
-    if args.disclosed_quantity is not None:
-        kwargs["disclosed_quantity"] = args.disclosed_quantity
-    if args.validity:
-        kwargs["validity"] = args.validity
-    if args.validity_ttl is not None:
-        kwargs["validity_ttl"] = args.validity_ttl
-    if args.iceberg_legs is not None:
-        kwargs["iceberg_legs"] = args.iceberg_legs
-    if args.iceberg_quantity is not None:
-        kwargs["iceberg_quantity"] = args.iceberg_quantity
-    if args.tag:
-        kwargs["tag"] = args.tag
+    # --- 5. --wait-for-fill -------------------------------------------------
+    if args.wait_for_fill > 0:
+        final_status = _wait_for_fill(client, order_id, timeout=args.wait_for_fill)
+        result["final_status"] = final_status.get("status")
+        result["filled_quantity"] = final_status.get("filled_quantity")
+        result["average_price"] = final_status.get("average_price")
+        result["status_message"] = final_status.get("status_message")
 
-    try:
-        order_id = client.place_order(**kwargs)
-    except Exception as exc:
-        print(f"ERROR: place_order failed: {exc}", file=sys.stderr)
-        return 1
-
-    print(f"order placed: order_id={order_id}", file=sys.stderr)
-    _emit({"order_id": order_id, **kwargs}, args.format)
+    _emit(result, args.format)
     return 0
+
+
+def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
+    """Poll order_history until order reaches a terminal state or timeout."""
+    terminal = {"COMPLETE", "REJECTED", "CANCELLED"}
+    deadline = time.monotonic() + timeout
+    last: dict = {}
+    while time.monotonic() < deadline:
+        try:
+            _RATE_LIMITER.wait_general()
+            history = client.order_history(order_id) or []
+            if history:
+                last = history[-1]
+                if last.get("status") in terminal:
+                    return last
+        except Exception as exc:
+            log.warning("order_history poll failed: %s", exc)
+        time.sleep(0.5)
+    return last or {"status": "TIMEOUT"}
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -1371,6 +1559,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("profile", cmd_profile, "User profile (verify session)")
     add("session", cmd_session, "Current session status + approx expiry")
+    add("health", cmd_health, "End-to-end health check (session, API, margins, market data)")
     add("logout", cmd_logout, "Invalidate access token + remove local session file")
 
     # --- account ---
@@ -1383,13 +1572,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--which", choices=["net", "day"], default="net")
 
     s = add("convert-position", cmd_convert_position, "Convert position product (MIS↔CNC↔NRML)")
-    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"])
     s.add_argument("--tradingsymbol", required=True)
     s.add_argument("--transaction-type", required=True, choices=["BUY", "SELL"])
     s.add_argument("--position-type", required=True, choices=["day", "overnight"])
     s.add_argument("--quantity", type=int, required=True)
-    s.add_argument("--old-product", required=True, choices=["CNC", "MIS", "NRML"])
-    s.add_argument("--new-product", required=True, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--old-product", required=True, choices=["CNC", "MIS", "NRML", "MTF"])
+    s.add_argument("--new-product", required=True, choices=["CNC", "MIS", "NRML", "MTF"])
     _add_yes(s)
 
     add("pnl", cmd_pnl, "Aggregate P&L from positions (day + net)")
@@ -1419,12 +1608,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("depth", cmd_depth, "Market depth (5-level order book)")
     s.add_argument("--symbols", required=True, help="Single or comma-separated: NSE:RELIANCE")
 
-    s = add("stream", cmd_stream, "Live WebSocket tick stream (KiteTicker)")
+    s = add("stream", cmd_stream, "Live WebSocket tick stream (KiteTicker, auto-reconnect)")
     s.add_argument("--symbols", default="", help="Comma list: NSE:RELIANCE,NFO:NIFTY...")
     s.add_argument("--tokens", default="", help="Comma list of instrument_token ints")
     s.add_argument("--mode", default="full", choices=["ltp", "quote", "full"])
     s.add_argument("--duration", type=float, default=0, help="Seconds to stream (0=until Ctrl+C)")
     s.add_argument("--order-updates", action="store_true", help="Also stream order update events")
+    s.add_argument("--reconnect-max-tries", type=int, default=50, help="Max reconnection attempts")
+    s.add_argument("--reconnect-max-delay", type=int, default=60, help="Max backoff between reconnects (s)")
 
     # --- historical ---
     s = add("history", cmd_history, "Historical OHLC bars")
@@ -1489,22 +1680,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--risk-free-rate", type=float, default=None)
 
     # --- orders (write path) ---
-    s = add("place", cmd_place, "Place a single order")
-    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s = add("place", cmd_place, "Place a single order (validated, idempotent, rate-limited)")
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"])
     s.add_argument("--tradingsymbol", required=True, help="e.g. RELIANCE, NIFTY2550822700CE")
     s.add_argument("--transaction-type", required=True, choices=["BUY", "SELL"])
     s.add_argument("--order-type", required=True, choices=["MARKET", "LIMIT", "SL", "SL-M"])
     s.add_argument("--quantity", type=int, required=True)
-    s.add_argument("--product", required=True, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--product", required=True, choices=["CNC", "MIS", "NRML", "MTF"])
     s.add_argument("--price", type=float, default=None, help="Limit price (for LIMIT/SL)")
     s.add_argument("--trigger-price", type=float, default=None, help="Trigger price (for SL/SL-M)")
     s.add_argument("--validity", default="DAY", choices=["DAY", "IOC", "TTL"])
     s.add_argument("--validity-ttl", type=int, default=None, help="TTL minutes (for TTL validity)")
-    s.add_argument("--variety", default="regular", choices=["regular", "amo", "co", "iceberg"])
+    s.add_argument("--variety", default="regular", choices=["regular", "amo", "co", "iceberg", "auction"])
     s.add_argument("--disclosed-quantity", type=int, default=None)
     s.add_argument("--iceberg-legs", type=int, default=None)
     s.add_argument("--iceberg-quantity", type=int, default=None)
-    s.add_argument("--tag", default=None, help="Optional order tag for audit")
+    s.add_argument("--tag", default=None, help="Order tag (auto-generated if omitted; used for idempotency)")
+    s.add_argument("--dry-run", action="store_true", help="Preview margin/charges via order_margins(); DO NOT place")
+    s.add_argument("--wait-for-fill", type=float, default=0, help="Poll for N seconds until COMPLETE/REJECTED/CANCELLED (0=return immediately)")
     _add_yes(s)
 
     s = add("cancel", cmd_cancel, "Cancel one order by id")
@@ -1532,14 +1725,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trigger-id", type=int, required=True)
 
     s = add("gtt-create", cmd_gtt_create, "Create a GTT (single or OCO two-leg)")
-    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"])
     s.add_argument("--tradingsymbol", required=True)
     s.add_argument("--transaction-type", default="SELL", choices=["BUY", "SELL"])
     s.add_argument("--trigger-values", required=True, help="Comma-separated: '300' (single) or '280,320' (OCO)")
     s.add_argument("--last-price", type=float, required=True, help="Current/reference price")
     s.add_argument("--quantity", type=int, default=None)
     s.add_argument("--order-type", default="LIMIT", choices=["MARKET", "LIMIT", "SL", "SL-M"])
-    s.add_argument("--product", default="CNC", choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--product", default="CNC", choices=["CNC", "MIS", "NRML", "MTF"])
     s.add_argument("--price", type=float, default=None, help="Limit price for leg 1")
     s.add_argument("--price2", type=float, default=None, help="Limit price for OCO leg 2")
     s.add_argument("--orders-json", default=None, help="Full order legs as JSON (overrides simple args)")
@@ -1565,7 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tradingsymbol", default=None)
     s.add_argument("--transaction-type", default=None, choices=["BUY", "SELL"])
     s.add_argument("--quantity", type=int, default=None)
-    s.add_argument("--product", default=None, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--product", default=None, choices=["CNC", "MIS", "NRML", "MTF"])
     s.add_argument("--order-type", default=None, choices=["MARKET", "LIMIT", "SL", "SL-M"])
     s.add_argument("--variety", default=None)
     s.add_argument("--price", type=float, default=None)
