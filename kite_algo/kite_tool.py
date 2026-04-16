@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import signal
 import sys
 import time
 import urllib.parse
@@ -50,6 +51,15 @@ def _import_kiteconnect() -> Any:
         print("Install: pip install kiteconnect", file=sys.stderr)
         sys.exit(2)
     return KiteConnect
+
+
+def _import_kiteticker() -> Any:
+    try:
+        from kiteconnect import KiteTicker  # type: ignore
+    except ImportError as exc:
+        print(f"ERROR: kiteconnect is not installed: {exc}", file=sys.stderr)
+        sys.exit(2)
+    return KiteTicker
 
 
 # -----------------------------------------------------------------------------
@@ -119,7 +129,6 @@ def _emit(data: Any, fmt: str) -> None:
 # -----------------------------------------------------------------------------
 
 def _new_client(require_session: bool = True) -> Any:
-    """Instantiate a KiteConnect client with credentials + access token from env."""
     KiteConnect = _import_kiteconnect()
     cfg = KiteConfig.from_env()
     if require_session:
@@ -137,15 +146,6 @@ def _new_client(require_session: bool = True) -> Any:
 # =============================================================================
 
 def cmd_login(args: argparse.Namespace) -> int:
-    """Interactive OAuth login.
-
-    1. Build the Kite login URL and open it in a browser.
-    2. User signs in with Zerodha creds + 2FA.
-    3. Kite redirects to the configured redirect_uri with ?request_token=...
-    4. User copies the request_token and pastes it into the prompt.
-    5. We exchange request_token + api_secret → access_token via generate_session().
-    6. Write data/session.json.
-    """
     KiteConnect = _import_kiteconnect()
     cfg = KiteConfig.from_env()
     cfg.require_credentials()
@@ -264,6 +264,22 @@ def cmd_holdings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_authorise_holdings(args: argparse.Namespace) -> int:
+    """Authorise holdings for T1 sell (DDPI/TPIN flow)."""
+    client = _new_client()
+    isins = [s.strip() for s in args.isins.split(",") if s.strip()]
+    if not isins:
+        print("ERROR: --isins required (comma-separated ISINs)", file=sys.stderr)
+        return 1
+    try:
+        data = client.authorise(isins)
+    except Exception as exc:
+        print(f"ERROR: authorise failed: {exc}", file=sys.stderr)
+        return 1
+    _emit(data, args.format)
+    return 0
+
+
 def cmd_positions(args: argparse.Namespace) -> int:
     client = _new_client()
     data = client.positions() or {}
@@ -272,9 +288,111 @@ def cmd_positions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_convert_position(args: argparse.Namespace) -> int:
+    """Convert position product type (e.g. MIS → CNC, NRML → MIS)."""
+    _require_yes(args, "convert a position")
+    client = _new_client()
+    try:
+        client.convert_position(
+            exchange=args.exchange,
+            tradingsymbol=args.tradingsymbol,
+            transaction_type=args.transaction_type,
+            position_type=args.position_type,
+            quantity=args.quantity,
+            old_product=args.old_product,
+            new_product=args.new_product,
+        )
+    except Exception as exc:
+        print(f"ERROR: convert_position failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"converted: {args.tradingsymbol} {args.quantity}x "
+        f"{args.old_product}→{args.new_product}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_pnl(args: argparse.Namespace) -> int:
+    """Aggregate P&L from positions (net) — day P&L, unrealised, realised."""
+    client = _new_client()
+    data = client.positions() or {}
+    net = data.get("net", [])
+    day = data.get("day", [])
+
+    total_pnl = sum(float(p.get("pnl", 0) or 0) for p in net)
+    total_m2m = sum(float(p.get("m2m", 0) or 0) for p in day)
+    total_realised = sum(float(p.get("realised", 0) or 0) for p in net)
+    total_unrealised = sum(float(p.get("unrealised", 0) or 0) for p in net)
+    total_day_buy = sum(float(p.get("day_buy_value", 0) or 0) for p in net)
+    total_day_sell = sum(float(p.get("day_sell_value", 0) or 0) for p in net)
+
+    out = {
+        "net_pnl": round(total_pnl, 2),
+        "day_m2m": round(total_m2m, 2),
+        "realised": round(total_realised, 2),
+        "unrealised": round(total_unrealised, 2),
+        "day_buy_value": round(total_day_buy, 2),
+        "day_sell_value": round(total_day_sell, 2),
+        "open_positions": sum(1 for p in net if int(p.get("quantity", 0) or 0) != 0),
+    }
+    _emit(out, args.format)
+    return 0
+
+
+def cmd_portfolio(args: argparse.Namespace) -> int:
+    """Combined portfolio view: holdings + open positions with MTM values."""
+    client = _new_client()
+    holdings = client.holdings() or []
+    pos_data = client.positions() or {}
+    net_positions = pos_data.get("net", [])
+
+    rows = []
+    for h in holdings:
+        rows.append({
+            "type": "holding",
+            "tradingsymbol": h.get("tradingsymbol"),
+            "exchange": h.get("exchange"),
+            "quantity": h.get("quantity"),
+            "avg_price": h.get("average_price"),
+            "last_price": h.get("last_price"),
+            "pnl": h.get("pnl"),
+            "day_change_pct": h.get("day_change_percentage"),
+            "product": "CNC",
+        })
+
+    for p in net_positions:
+        qty = int(p.get("quantity", 0) or 0)
+        if qty == 0:
+            continue
+        rows.append({
+            "type": "position",
+            "tradingsymbol": p.get("tradingsymbol"),
+            "exchange": p.get("exchange"),
+            "quantity": qty,
+            "avg_price": p.get("average_price"),
+            "last_price": p.get("last_price"),
+            "pnl": p.get("pnl"),
+            "day_change_pct": None,
+            "product": p.get("product"),
+        })
+
+    _emit(rows, args.format)
+    return 0
+
+
 def cmd_orders(args: argparse.Namespace) -> int:
     client = _new_client()
     _emit(client.orders(), args.format)
+    return 0
+
+
+def cmd_open_orders(args: argparse.Namespace) -> int:
+    """Show only OPEN / TRIGGER PENDING orders."""
+    client = _new_client()
+    orders = client.orders() or []
+    open_only = [o for o in orders if o.get("status") in ("OPEN", "TRIGGER PENDING")]
+    _emit(open_only, args.format)
     return 0
 
 
@@ -365,13 +483,103 @@ def cmd_quote(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_depth(args: argparse.Namespace) -> int:
+    """Market depth (5-level order book) for a single symbol."""
+    client = _new_client()
+    symbols = _split_symbols(args.symbols)
+    data = client.quote(symbols)
+    for sym, v in (data or {}).items():
+        depth = v.get("depth", {}) or {}
+        buys = depth.get("buy", []) or []
+        sells = depth.get("sell", []) or []
+        print(f"\n=== {sym}  LTP: {v.get('last_price')} ===", file=sys.stderr)
+        rows = []
+        for i in range(max(len(buys), len(sells))):
+            b = buys[i] if i < len(buys) else {}
+            s = sells[i] if i < len(sells) else {}
+            rows.append({
+                "bid_orders": b.get("orders"),
+                "bid_qty": b.get("quantity"),
+                "bid": b.get("price"),
+                "ask": s.get("price"),
+                "ask_qty": s.get("quantity"),
+                "ask_orders": s.get("orders"),
+            })
+        _emit(rows, args.format)
+    return 0
+
+
 def cmd_stream(args: argparse.Namespace) -> int:
-    print(
-        "ERROR: `stream` (KiteTicker WebSocket) is not yet implemented. "
-        "Coming next — will stream live ticks for the given instrument tokens.",
-        file=sys.stderr,
-    )
-    return 2
+    """Live WebSocket tick stream via KiteTicker."""
+    KiteTicker = _import_kiteticker()
+    cfg = KiteConfig.from_env()
+    cfg.require_session()
+
+    client = _new_client()
+
+    # Resolve symbols → instrument tokens
+    tokens: list[int] = []
+    if args.tokens:
+        tokens = [int(t.strip()) for t in args.tokens.split(",") if t.strip()]
+    elif args.symbols:
+        syms = _split_symbols(args.symbols)
+        ltp_data = client.ltp(syms)
+        for sym, v in (ltp_data or {}).items():
+            tok = v.get("instrument_token")
+            if tok:
+                tokens.append(int(tok))
+            else:
+                print(f"WARN: could not resolve token for {sym}", file=sys.stderr)
+    if not tokens:
+        print("ERROR: no instrument tokens. Use --symbols or --tokens.", file=sys.stderr)
+        return 1
+
+    mode_map = {"ltp": "ltp", "quote": "quote", "full": "full"}
+    subscribe_mode = mode_map.get(args.mode, "full")
+
+    duration = args.duration
+    start_time = time.time()
+
+    kws = KiteTicker(cfg.api_key, cfg.access_token)
+
+    def on_ticks(ws: Any, ticks: list[dict]) -> None:
+        for tick in ticks:
+            print(json.dumps(_to_jsonable(tick), default=str), flush=True)
+
+    def on_connect(ws: Any, response: Any) -> None:
+        print(f"connected, subscribing {len(tokens)} tokens in mode={subscribe_mode}", file=sys.stderr)
+        ws.subscribe(tokens)
+        ws.set_mode(subscribe_mode, tokens)
+
+    def on_close(ws: Any, code: Any, reason: Any) -> None:
+        print(f"ws closed: code={code} reason={reason}", file=sys.stderr)
+
+    def on_error(ws: Any, code: Any, reason: Any) -> None:
+        print(f"ws error: code={code} reason={reason}", file=sys.stderr)
+
+    def on_order_update(ws: Any, data: dict) -> None:
+        print(json.dumps({"_type": "order_update", **_to_jsonable(data)}, default=str), flush=True)
+
+    kws.on_ticks = on_ticks
+    kws.on_connect = on_connect
+    kws.on_close = on_close
+    kws.on_error = on_error
+    if args.order_updates:
+        kws.on_order_update = on_order_update
+
+    # Duration-based stop
+    if duration > 0:
+        def _alarm(signum: int, frame: Any) -> None:
+            print(f"\n{duration}s elapsed, disconnecting.", file=sys.stderr)
+            kws.close()
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(int(duration))
+
+    try:
+        kws.connect(threaded=False)
+    except KeyboardInterrupt:
+        kws.close()
+    return 0
 
 
 # =============================================================================
@@ -381,7 +589,6 @@ def cmd_stream(args: argparse.Namespace) -> int:
 def cmd_history(args: argparse.Namespace) -> int:
     client = _new_client()
     if args.instrument_token is None:
-        # Resolve symbol via the local instruments cache
         token = _resolve_token(client, args.symbol, args.exchange)
         if token is None:
             print(f"ERROR: could not resolve instrument token for {args.exchange}:{args.symbol}", file=sys.stderr)
@@ -441,7 +648,6 @@ def _load_cached_instruments(exchange: str) -> list[dict] | None:
 def _save_cached_instruments(exchange: str, rows: list[dict]) -> Path:
     INSTRUMENTS_CACHE.mkdir(parents=True, exist_ok=True)
     path = _instruments_cache_path(exchange)
-    # dates are not JSON-serializable out of the box
     clean = []
     for r in rows:
         c = dict(r)
@@ -469,7 +675,6 @@ def cmd_instruments(args: argparse.Namespace) -> int:
     if args.dump:
         _emit(rows, args.format)
         return 0
-    # Default: print a summary
     by_segment: dict[str, int] = {}
     for r in rows:
         by_segment[r.get("segment", "UNKNOWN")] = by_segment.get(r.get("segment", "UNKNOWN"), 0) + 1
@@ -510,6 +715,23 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_contract(args: argparse.Namespace) -> int:
+    """Full instrument details for a single tradingsymbol."""
+    client = _new_client()
+    rows = _fetch_instruments(client, args.exchange or "")
+    sym_upper = args.tradingsymbol.upper()
+    match = None
+    for r in rows:
+        if (r.get("tradingsymbol") or "").upper() == sym_upper:
+            match = r
+            break
+    if not match:
+        print(f"ERROR: instrument not found: {args.exchange}:{args.tradingsymbol}", file=sys.stderr)
+        return 1
+    _emit(match, args.format)
+    return 0
+
+
 def _resolve_token(client: Any, symbol: str, exchange: str) -> int | None:
     rows = _fetch_instruments(client, exchange or "NSE")
     for r in rows:
@@ -528,6 +750,39 @@ def cmd_expiries(args: argparse.Namespace) -> int:
     expiries = sorted({r.get("expiry") for r in rows if (r.get("name") or "").upper() == args.symbol.upper() and r.get("expiry")})
     _emit([{"expiry": e} for e in expiries], args.format)
     return 0
+
+
+def _compute_greeks_for_option(
+    spot: float, strike: float, expiry_str: str, right: str,
+    last_price: float | None, risk_free_rate: float,
+) -> dict[str, float | None]:
+    """Compute BSM greeks for a single option leg."""
+    from kite_algo.greeks import implied_vol, greeks as compute_greeks
+
+    if not last_price or last_price <= 0 or not spot or spot <= 0:
+        return {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    try:
+        exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date() if isinstance(expiry_str, str) else expiry_str
+    except (ValueError, TypeError):
+        return {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    T = max((exp_date - date.today()).days, 0) / 365.0
+    if T <= 0:
+        return {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    iv = implied_vol(last_price, spot, strike, T, risk_free_rate, right)
+    if iv is None:
+        return {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    g = compute_greeks(spot, strike, T, risk_free_rate, iv, right)
+    return {
+        "iv": round(iv * 100, 2),
+        "delta": round(g["delta"], 4),
+        "gamma": round(g["gamma"], 6),
+        "theta": round(g["theta"], 4),
+        "vega": round(g["vega"], 4),
+    }
 
 
 def cmd_chain(args: argparse.Namespace) -> int:
@@ -553,11 +808,29 @@ def cmd_chain(args: argparse.Namespace) -> int:
         for i in range(0, len(symbols), BATCH):
             quote_data.update(client.quote(symbols[i:i + BATCH]) or {})
 
+        # Get underlying spot for greeks
+        spot = None
+        if args.greeks:
+            underlying_sym = args.symbol.upper()
+            spot_data = client.ltp([f"NSE:{underlying_sym}"])
+            spot_val = (spot_data or {}).get(f"NSE:{underlying_sym}", {})
+            spot = spot_val.get("last_price")
+            if not spot:
+                # Try index (NIFTY, BANKNIFTY)
+                idx_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK", "FINNIFTY": "NSE:NIFTY FIN SERVICE"}
+                idx_key = idx_map.get(underlying_sym)
+                if idx_key:
+                    idx_data = client.ltp([idx_key])
+                    spot = (idx_data or {}).get(idx_key, {}).get("last_price")
+
+        from kite_algo.greeks import default_risk_free_rate
+        rfr = args.risk_free_rate if hasattr(args, "risk_free_rate") and args.risk_free_rate is not None else default_risk_free_rate()
+
         out = []
         for r in chain:
             key = f"NFO:{r.get('tradingsymbol')}"
             q = quote_data.get(key, {}) or {}
-            out.append({
+            row: dict[str, Any] = {
                 "strike": r.get("strike"),
                 "right": r.get("instrument_type"),
                 "symbol": r.get("tradingsymbol"),
@@ -568,7 +841,16 @@ def cmd_chain(args: argparse.Namespace) -> int:
                 "net_change": q.get("net_change"),
                 "lot_size": r.get("lot_size"),
                 "instrument_token": r.get("instrument_token"),
-            })
+            }
+            if args.greeks and spot:
+                g = _compute_greeks_for_option(
+                    spot, float(r.get("strike", 0)),
+                    str(r.get("expiry", "")),
+                    r.get("instrument_type", "CE"),
+                    q.get("last_price"), rfr,
+                )
+                row.update(g)
+            out.append(row)
     else:
         out = [
             {
@@ -605,7 +887,8 @@ def cmd_option_quote(args: argparse.Namespace) -> int:
         return 1
     key = f"NFO:{match.get('tradingsymbol')}"
     q = (client.quote([key]) or {}).get(key, {}) or {}
-    out = {
+
+    out: dict[str, Any] = {
         "tradingsymbol": match.get("tradingsymbol"),
         "instrument_token": match.get("instrument_token"),
         "lot_size": match.get("lot_size"),
@@ -616,14 +899,66 @@ def cmd_option_quote(args: argparse.Namespace) -> int:
         "depth": q.get("depth"),
         "avg_price": q.get("average_price"),
         "net_change": q.get("net_change"),
-        # TODO: locally computed greeks via Black-Scholes using underlying spot + IV solve
     }
+
+    # Compute greeks if --greeks flag set
+    if args.greeks:
+        underlying_sym = args.symbol.upper()
+        spot_data = client.ltp([f"NSE:{underlying_sym}"])
+        spot = (spot_data or {}).get(f"NSE:{underlying_sym}", {}).get("last_price")
+        if not spot:
+            idx_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK", "FINNIFTY": "NSE:NIFTY FIN SERVICE"}
+            idx_key = idx_map.get(underlying_sym)
+            if idx_key:
+                idx_data = client.ltp([idx_key])
+                spot = (idx_data or {}).get(idx_key, {}).get("last_price")
+
+        if spot:
+            from kite_algo.greeks import default_risk_free_rate
+            rfr = args.risk_free_rate if hasattr(args, "risk_free_rate") and args.risk_free_rate is not None else default_risk_free_rate()
+            g = _compute_greeks_for_option(
+                spot, float(args.strike), args.expiry,
+                args.right.upper(), q.get("last_price"), rfr,
+            )
+            out["spot"] = spot
+            out.update(g)
+        else:
+            print(f"WARN: could not resolve underlying spot for {underlying_sym}", file=sys.stderr)
+
+    _emit(out, args.format)
+    return 0
+
+
+def cmd_calc_iv(args: argparse.Namespace) -> int:
+    """Calculate implied volatility from market price."""
+    from kite_algo.greeks import implied_vol, default_risk_free_rate
+
+    rfr = args.risk_free_rate if args.risk_free_rate is not None else default_risk_free_rate()
+    T = args.dte / 365.0
+    iv = implied_vol(args.market_price, args.spot, args.strike, T, rfr, args.right)
+    if iv is None:
+        print("ERROR: IV solver did not converge", file=sys.stderr)
+        return 1
+    _emit({"iv_pct": round(iv * 100, 2), "iv_decimal": round(iv, 6)}, args.format)
+    return 0
+
+
+def cmd_calc_price(args: argparse.Namespace) -> int:
+    """Calculate theoretical option price + greeks from IV."""
+    from kite_algo.greeks import greeks as compute_greeks, default_risk_free_rate
+
+    rfr = args.risk_free_rate if args.risk_free_rate is not None else default_risk_free_rate()
+    T = args.dte / 365.0
+    sigma = args.iv / 100.0
+    g = compute_greeks(args.spot, args.strike, T, rfr, sigma, args.right)
+    out = {k: round(v, 6) for k, v in g.items()}
+    out["iv_pct"] = round(args.iv, 2)
     _emit(out, args.format)
     return 0
 
 
 # =============================================================================
-# ORDERS (write path — stubbed, gated)
+# ORDERS (write path)
 # =============================================================================
 
 def _require_yes(args: argparse.Namespace, action: str) -> None:
@@ -635,13 +970,46 @@ def _require_yes(args: argparse.Namespace, action: str) -> None:
 
 
 def cmd_place(args: argparse.Namespace) -> int:
+    """Place a single order via Kite Connect."""
     _require_yes(args, "place an order")
-    print(
-        "ERROR: `place` is a safety-gated stub pending KiteBroker write-path "
-        "implementation. Edit kite_algo/broker/kite.py to enable.",
-        file=sys.stderr,
-    )
-    return 2
+    client = _new_client()
+
+    kwargs: dict[str, Any] = {
+        "variety": args.variety,
+        "exchange": args.exchange,
+        "tradingsymbol": args.tradingsymbol,
+        "transaction_type": args.transaction_type,
+        "quantity": args.quantity,
+        "product": args.product,
+        "order_type": args.order_type,
+    }
+
+    if args.price is not None:
+        kwargs["price"] = args.price
+    if args.trigger_price is not None:
+        kwargs["trigger_price"] = args.trigger_price
+    if args.disclosed_quantity is not None:
+        kwargs["disclosed_quantity"] = args.disclosed_quantity
+    if args.validity:
+        kwargs["validity"] = args.validity
+    if args.validity_ttl is not None:
+        kwargs["validity_ttl"] = args.validity_ttl
+    if args.iceberg_legs is not None:
+        kwargs["iceberg_legs"] = args.iceberg_legs
+    if args.iceberg_quantity is not None:
+        kwargs["iceberg_quantity"] = args.iceberg_quantity
+    if args.tag:
+        kwargs["tag"] = args.tag
+
+    try:
+        order_id = client.place_order(**kwargs)
+    except Exception as exc:
+        print(f"ERROR: place_order failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"order placed: order_id={order_id}", file=sys.stderr)
+    _emit({"order_id": order_id, **kwargs}, args.format)
+    return 0
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -712,19 +1080,105 @@ def cmd_gtt_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_gtt_create(args: argparse.Namespace) -> int:
+    """Create a GTT (Good Till Triggered) order.
+
+    Single-leg: one trigger value + one order.
+    Two-leg (OCO): two trigger values (stoploss, target) + two orders.
+    """
     _require_yes(args, "create a GTT")
-    print(
-        "ERROR: `gtt-create` stub pending — the full create flow needs order "
-        "leg JSON parsing. Coming next.",
-        file=sys.stderr,
-    )
-    return 2
+    client = _new_client()
+
+    trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
+    if len(trigger_values) == 1:
+        trigger_type = client.GTT_TYPE_SINGLE
+    elif len(trigger_values) == 2:
+        trigger_type = client.GTT_TYPE_OCO
+    else:
+        print("ERROR: --trigger-values must be 1 (single) or 2 (OCO) comma-separated values", file=sys.stderr)
+        return 1
+
+    # Build order legs
+    orders = []
+    if args.orders_json:
+        try:
+            orders = json.loads(args.orders_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: --orders-json parse failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        # Build from simple args (single-leg shorthand)
+        order = {
+            "exchange": args.exchange,
+            "tradingsymbol": args.tradingsymbol,
+            "transaction_type": args.transaction_type,
+            "quantity": args.quantity,
+            "order_type": args.order_type or "LIMIT",
+            "product": args.product or "CNC",
+            "price": args.price or 0,
+        }
+        orders.append(order)
+        # For OCO, second leg
+        if len(trigger_values) == 2:
+            order2 = dict(order)
+            if args.price2 is not None:
+                order2["price"] = args.price2
+            orders.append(order2)
+
+    try:
+        trigger_id = client.place_gtt(
+            trigger_type=trigger_type,
+            tradingsymbol=args.tradingsymbol,
+            exchange=args.exchange,
+            trigger_values=trigger_values,
+            last_price=args.last_price,
+            orders=orders,
+        )
+    except Exception as exc:
+        print(f"ERROR: place_gtt failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"GTT created: trigger_id={trigger_id}", file=sys.stderr)
+    _emit({"trigger_id": trigger_id}, args.format)
+    return 0
 
 
 def cmd_gtt_modify(args: argparse.Namespace) -> int:
+    """Modify an existing GTT trigger."""
     _require_yes(args, "modify a GTT")
-    print("ERROR: `gtt-modify` stub pending.", file=sys.stderr)
-    return 2
+    client = _new_client()
+
+    trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
+    if len(trigger_values) == 1:
+        trigger_type = client.GTT_TYPE_SINGLE
+    elif len(trigger_values) == 2:
+        trigger_type = client.GTT_TYPE_OCO
+    else:
+        print("ERROR: --trigger-values must be 1 or 2 values", file=sys.stderr)
+        return 1
+
+    try:
+        orders = json.loads(args.orders_json)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: --orders-json parse failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        trigger_id = client.modify_gtt(
+            trigger_id=args.trigger_id,
+            trigger_type=trigger_type,
+            tradingsymbol=args.tradingsymbol,
+            exchange=args.exchange,
+            trigger_values=trigger_values,
+            last_price=args.last_price,
+            orders=orders,
+        )
+    except Exception as exc:
+        print(f"ERROR: modify_gtt failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"GTT modified: trigger_id={trigger_id}", file=sys.stderr)
+    _emit({"trigger_id": trigger_id}, args.format)
+    return 0
 
 
 # =============================================================================
@@ -733,11 +1187,23 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
 
 def cmd_margin_calc(args: argparse.Namespace) -> int:
     client = _new_client()
-    try:
-        orders = json.loads(args.orders_json)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: --orders-json must be valid JSON: {exc}", file=sys.stderr)
-        return 1
+    if args.orders_json:
+        try:
+            orders = json.loads(args.orders_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: --orders-json must be valid JSON: {exc}", file=sys.stderr)
+            return 1
+    else:
+        orders = [{
+            "exchange": args.exchange,
+            "tradingsymbol": args.tradingsymbol,
+            "transaction_type": args.transaction_type,
+            "variety": args.variety or "regular",
+            "product": args.product,
+            "order_type": args.order_type or "MARKET",
+            "quantity": args.quantity,
+            "price": args.price or 0,
+        }]
     data = client.order_margins(orders)
     _emit(data, args.format)
     return 0
@@ -777,6 +1243,97 @@ def cmd_mf_sips(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mf_instruments(args: argparse.Namespace) -> int:
+    client = _new_client()
+    data = client.mf_instruments()
+    _emit(data, args.format)
+    return 0
+
+
+def cmd_mf_place(args: argparse.Namespace) -> int:
+    _require_yes(args, "place a mutual fund order")
+    client = _new_client()
+    try:
+        order_id = client.place_mf_order(
+            tradingsymbol=args.tradingsymbol,
+            transaction_type=args.transaction_type,
+            quantity=args.quantity if args.quantity else None,
+            amount=args.amount if args.amount else None,
+            tag=args.tag,
+        )
+    except Exception as exc:
+        print(f"ERROR: place_mf_order failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"MF order placed: order_id={order_id}", file=sys.stderr)
+    _emit({"order_id": order_id}, args.format)
+    return 0
+
+
+def cmd_mf_cancel(args: argparse.Namespace) -> int:
+    _require_yes(args, "cancel a mutual fund order")
+    client = _new_client()
+    try:
+        client.cancel_mf_order(order_id=args.order_id)
+    except Exception as exc:
+        print(f"ERROR: cancel_mf_order failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"MF order cancelled: order_id={args.order_id}", file=sys.stderr)
+    return 0
+
+
+def cmd_mf_sip_create(args: argparse.Namespace) -> int:
+    _require_yes(args, "create a mutual fund SIP")
+    client = _new_client()
+    try:
+        sip_id = client.place_mf_sip(
+            tradingsymbol=args.tradingsymbol,
+            amount=args.amount,
+            initial_amount=args.initial_amount,
+            frequency=args.frequency,
+            instalments=args.instalments,
+            tag=args.tag,
+        )
+    except Exception as exc:
+        print(f"ERROR: place_mf_sip failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"SIP created: sip_id={sip_id}", file=sys.stderr)
+    _emit({"sip_id": sip_id}, args.format)
+    return 0
+
+
+def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
+    _require_yes(args, "modify a mutual fund SIP")
+    client = _new_client()
+    kwargs: dict[str, Any] = {"sip_id": args.sip_id}
+    if args.amount is not None:
+        kwargs["amount"] = args.amount
+    if args.frequency:
+        kwargs["frequency"] = args.frequency
+    if args.instalments is not None:
+        kwargs["instalments"] = args.instalments
+    if args.status:
+        kwargs["status"] = args.status
+    try:
+        client.modify_mf_sip(**kwargs)
+    except Exception as exc:
+        print(f"ERROR: modify_mf_sip failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"SIP modified: sip_id={args.sip_id}", file=sys.stderr)
+    return 0
+
+
+def cmd_mf_sip_cancel(args: argparse.Namespace) -> int:
+    _require_yes(args, "cancel a mutual fund SIP")
+    client = _new_client()
+    try:
+        client.cancel_mf_sip(sip_id=args.sip_id)
+    except Exception as exc:
+        print(f"ERROR: cancel_mf_sip failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"SIP cancelled: sip_id={args.sip_id}", file=sys.stderr)
+    return 0
+
+
 # =============================================================================
 # Argparse wiring
 # =============================================================================
@@ -798,6 +1355,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(func=fn)
         return sp
 
+    def _add_yes(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--yes", action="store_true", help="Required live confirmation flag")
+
     # --- auth ---
     s = add("login", cmd_login, "Interactive OAuth login (writes data/session.json)")
     s.add_argument("--request-token", default=None, help="Skip prompt; use this request_token")
@@ -811,13 +1371,30 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("margins", cmd_margins, "Account margins")
     s.add_argument("--segment", choices=["equity", "commodity"], default=None)
 
-    add("holdings", cmd_holdings, "Demat holdings")
+    s = add("holdings", cmd_holdings, "Demat holdings")
+
+    s = add("authorise-holdings", cmd_authorise_holdings, "Authorise T1 holdings for selling (DDPI)")
+    s.add_argument("--isins", required=True, help="Comma-separated ISINs to authorise")
 
     s = add("positions", cmd_positions, "Day or net positions")
     s.add_argument("--which", choices=["net", "day"], default="net")
 
-    add("orders", cmd_orders, "Today's orders")
-    add("trades", cmd_trades, "Today's trades")
+    s = add("convert-position", cmd_convert_position, "Convert position product (MIS↔CNC↔NRML)")
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s.add_argument("--tradingsymbol", required=True)
+    s.add_argument("--transaction-type", required=True, choices=["BUY", "SELL"])
+    s.add_argument("--position-type", required=True, choices=["day", "overnight"])
+    s.add_argument("--quantity", type=int, required=True)
+    s.add_argument("--old-product", required=True, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--new-product", required=True, choices=["CNC", "MIS", "NRML"])
+    _add_yes(s)
+
+    add("pnl", cmd_pnl, "Aggregate P&L from positions (day + net)")
+    add("portfolio", cmd_portfolio, "Combined holdings + positions MTM view")
+
+    add("orders", cmd_orders, "Today's orders (all statuses)")
+    add("open-orders", cmd_open_orders, "Only OPEN / TRIGGER PENDING orders")
+    add("trades", cmd_trades, "Today's trades (fills)")
 
     s = add("order-history", cmd_order_history, "State history for one order")
     s.add_argument("--order-id", required=True)
@@ -836,9 +1413,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--symbols", required=True)
     s.add_argument("--flat", action="store_true", help="Flatten top-of-book to one row per symbol")
 
-    s = add("stream", cmd_stream, "Live WebSocket tick stream (KiteTicker) — stub")
-    s.add_argument("--symbols", default="")
-    s.add_argument("--duration", type=float, default=30.0)
+    s = add("depth", cmd_depth, "Market depth (5-level order book)")
+    s.add_argument("--symbols", required=True, help="Single or comma-separated: NSE:RELIANCE")
+
+    s = add("stream", cmd_stream, "Live WebSocket tick stream (KiteTicker)")
+    s.add_argument("--symbols", default="", help="Comma list: NSE:RELIANCE,NFO:NIFTY...")
+    s.add_argument("--tokens", default="", help="Comma list of instrument_token ints")
+    s.add_argument("--mode", default="full", choices=["ltp", "quote", "full"])
+    s.add_argument("--duration", type=float, default=0, help="Seconds to stream (0=until Ctrl+C)")
+    s.add_argument("--order-updates", action="store_true", help="Also stream order update events")
 
     # --- historical ---
     s = add("history", cmd_history, "Historical OHLC bars")
@@ -863,6 +1446,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--exchange", default="")
     s.add_argument("--limit", type=int, default=50)
 
+    s = add("contract", cmd_contract, "Full instrument details for a single symbol")
+    s.add_argument("--tradingsymbol", required=True)
+    s.add_argument("--exchange", default="NSE")
+
     # --- options ---
     s = add("expiries", cmd_expiries, "List NFO expiries for an underlying")
     s.add_argument("--symbol", required=True, help="Underlying name (e.g. NIFTY, BANKNIFTY, RELIANCE)")
@@ -871,18 +1458,50 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--symbol", required=True)
     s.add_argument("--expiry", required=True, help="YYYY-MM-DD")
     s.add_argument("--quote", action="store_true", help="Also fetch live quotes for every strike")
+    s.add_argument("--greeks", action="store_true", help="Compute BSM greeks (requires --quote)")
+    s.add_argument("--risk-free-rate", type=float, default=None, help="Risk-free rate (default 0.065)")
 
-    s = add("option-quote", cmd_option_quote, "Quote for a single option leg")
+    s = add("option-quote", cmd_option_quote, "Quote for a single option leg (with optional greeks)")
     s.add_argument("--symbol", required=True)
     s.add_argument("--expiry", required=True)
     s.add_argument("--strike", type=float, required=True)
     s.add_argument("--right", choices=["CE", "PE"], required=True)
+    s.add_argument("--greeks", action="store_true", help="Compute BSM greeks")
+    s.add_argument("--risk-free-rate", type=float, default=None)
+
+    s = add("calc-iv", cmd_calc_iv, "Calculate implied volatility from market price")
+    s.add_argument("--spot", type=float, required=True)
+    s.add_argument("--strike", type=float, required=True)
+    s.add_argument("--dte", type=float, required=True, help="Days to expiry")
+    s.add_argument("--market-price", type=float, required=True, help="Observed option price")
+    s.add_argument("--right", choices=["CE", "PE"], required=True)
+    s.add_argument("--risk-free-rate", type=float, default=None)
+
+    s = add("calc-price", cmd_calc_price, "Theoretical price + greeks from IV")
+    s.add_argument("--spot", type=float, required=True)
+    s.add_argument("--strike", type=float, required=True)
+    s.add_argument("--dte", type=float, required=True)
+    s.add_argument("--iv", type=float, required=True, help="IV in percent (e.g. 30 for 30%%)")
+    s.add_argument("--right", choices=["CE", "PE"], required=True)
+    s.add_argument("--risk-free-rate", type=float, default=None)
 
     # --- orders (write path) ---
-    def _add_yes(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--yes", action="store_true", help="Required live confirmation flag")
-
-    s = add("place", cmd_place, "Place a single order (pending implementation)")
+    s = add("place", cmd_place, "Place a single order")
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s.add_argument("--tradingsymbol", required=True, help="e.g. RELIANCE, NIFTY2550822700CE")
+    s.add_argument("--transaction-type", required=True, choices=["BUY", "SELL"])
+    s.add_argument("--order-type", required=True, choices=["MARKET", "LIMIT", "SL", "SL-M"])
+    s.add_argument("--quantity", type=int, required=True)
+    s.add_argument("--product", required=True, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--price", type=float, default=None, help="Limit price (for LIMIT/SL)")
+    s.add_argument("--trigger-price", type=float, default=None, help="Trigger price (for SL/SL-M)")
+    s.add_argument("--validity", default="DAY", choices=["DAY", "IOC", "TTL"])
+    s.add_argument("--validity-ttl", type=int, default=None, help="TTL minutes (for TTL validity)")
+    s.add_argument("--variety", default="regular", choices=["regular", "amo", "co", "iceberg"])
+    s.add_argument("--disclosed-quantity", type=int, default=None)
+    s.add_argument("--iceberg-legs", type=int, default=None)
+    s.add_argument("--iceberg-quantity", type=int, default=None)
+    s.add_argument("--tag", default=None, help="Optional order tag for audit")
     _add_yes(s)
 
     s = add("cancel", cmd_cancel, "Cancel one order by id")
@@ -909,11 +1528,27 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("gtt-get", cmd_gtt_get, "Get one GTT by trigger id")
     s.add_argument("--trigger-id", type=int, required=True)
 
-    s = add("gtt-create", cmd_gtt_create, "Create a GTT (pending implementation)")
+    s = add("gtt-create", cmd_gtt_create, "Create a GTT (single or OCO two-leg)")
+    s.add_argument("--exchange", required=True, choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS"])
+    s.add_argument("--tradingsymbol", required=True)
+    s.add_argument("--transaction-type", default="SELL", choices=["BUY", "SELL"])
+    s.add_argument("--trigger-values", required=True, help="Comma-separated: '300' (single) or '280,320' (OCO)")
+    s.add_argument("--last-price", type=float, required=True, help="Current/reference price")
+    s.add_argument("--quantity", type=int, default=None)
+    s.add_argument("--order-type", default="LIMIT", choices=["MARKET", "LIMIT", "SL", "SL-M"])
+    s.add_argument("--product", default="CNC", choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--price", type=float, default=None, help="Limit price for leg 1")
+    s.add_argument("--price2", type=float, default=None, help="Limit price for OCO leg 2")
+    s.add_argument("--orders-json", default=None, help="Full order legs as JSON (overrides simple args)")
     _add_yes(s)
 
-    s = add("gtt-modify", cmd_gtt_modify, "Modify a GTT (pending implementation)")
+    s = add("gtt-modify", cmd_gtt_modify, "Modify an existing GTT")
     s.add_argument("--trigger-id", type=int, required=True)
+    s.add_argument("--exchange", required=True)
+    s.add_argument("--tradingsymbol", required=True)
+    s.add_argument("--trigger-values", required=True)
+    s.add_argument("--last-price", type=float, required=True)
+    s.add_argument("--orders-json", required=True, help="Full order legs as JSON")
     _add_yes(s)
 
     s = add("gtt-delete", cmd_gtt_delete, "Delete a GTT")
@@ -921,16 +1556,58 @@ def build_parser() -> argparse.ArgumentParser:
     _add_yes(s)
 
     # --- margin calc ---
-    s = add("margin-calc", cmd_margin_calc, "Pre-trade margin for an order list")
-    s.add_argument("--orders-json", required=True, help="JSON list of order legs")
+    s = add("margin-calc", cmd_margin_calc, "Pre-trade margin for an order (or use --orders-json)")
+    s.add_argument("--orders-json", default=None, help="JSON list of order legs (full form)")
+    s.add_argument("--exchange", default=None)
+    s.add_argument("--tradingsymbol", default=None)
+    s.add_argument("--transaction-type", default=None, choices=["BUY", "SELL"])
+    s.add_argument("--quantity", type=int, default=None)
+    s.add_argument("--product", default=None, choices=["CNC", "MIS", "NRML"])
+    s.add_argument("--order-type", default=None, choices=["MARKET", "LIMIT", "SL", "SL-M"])
+    s.add_argument("--variety", default=None)
+    s.add_argument("--price", type=float, default=None)
 
-    s = add("basket-margin", cmd_basket_margin, "Margin benefit for a basket")
+    s = add("basket-margin", cmd_basket_margin, "Margin benefit for a basket of orders")
     s.add_argument("--orders-json", required=True)
 
     # --- MF ---
     add("mf-holdings", cmd_mf_holdings, "Mutual fund holdings")
     add("mf-orders", cmd_mf_orders, "Mutual fund orders")
     add("mf-sips", cmd_mf_sips, "Active mutual fund SIPs")
+    add("mf-instruments", cmd_mf_instruments, "All mutual fund schemes")
+
+    s = add("mf-place", cmd_mf_place, "Place a mutual fund order")
+    s.add_argument("--tradingsymbol", required=True, help="MF scheme tradingsymbol")
+    s.add_argument("--transaction-type", required=True, choices=["BUY", "SELL"])
+    s.add_argument("--quantity", type=float, default=None, help="Units (for SELL)")
+    s.add_argument("--amount", type=float, default=None, help="Amount in INR (for BUY)")
+    s.add_argument("--tag", default=None)
+    _add_yes(s)
+
+    s = add("mf-cancel", cmd_mf_cancel, "Cancel a mutual fund order")
+    s.add_argument("--order-id", required=True)
+    _add_yes(s)
+
+    s = add("mf-sip-create", cmd_mf_sip_create, "Create a mutual fund SIP")
+    s.add_argument("--tradingsymbol", required=True)
+    s.add_argument("--amount", type=float, required=True, help="SIP amount per instalment")
+    s.add_argument("--initial-amount", type=float, default=None, help="First instalment amount")
+    s.add_argument("--frequency", required=True, choices=["monthly", "weekly"])
+    s.add_argument("--instalments", type=int, required=True)
+    s.add_argument("--tag", default=None)
+    _add_yes(s)
+
+    s = add("mf-sip-modify", cmd_mf_sip_modify, "Modify a mutual fund SIP")
+    s.add_argument("--sip-id", required=True)
+    s.add_argument("--amount", type=float, default=None)
+    s.add_argument("--frequency", default=None, choices=["monthly", "weekly"])
+    s.add_argument("--instalments", type=int, default=None)
+    s.add_argument("--status", default=None, choices=["active", "paused"])
+    _add_yes(s)
+
+    s = add("mf-sip-cancel", cmd_mf_sip_cancel, "Cancel a mutual fund SIP")
+    s.add_argument("--sip-id", required=True)
+    _add_yes(s)
 
     return p
 
