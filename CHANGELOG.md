@@ -2,6 +2,19 @@
 
 ## 2026-04
 
+### Unreleased — OAuth callback listener (remote login)
+
+- **New `kite_algo/oauth_callback.py`**: one-shot HTTP listener on `http://127.0.0.1:<port>/` that captures Kite's `?action=login&status=success&request_token=...&state=...` 302 redirect automatically. Matches the pattern `gh auth login`, `stripe login`, `gcloud auth login` use. Zerodha explicitly permits `http://127.0.0.1` as a registered redirect URI — HTTPS is waived for loopback (forum 6583, 10096).
+- **CSRF defense**: every `login` invocation mints a 256-bit random nonce, passes it through Kite via `redirect_params=state=<nonce>`, and rejects any callback whose `state` doesn't match (`secrets.compare_digest`). A stale/stranded redirect from a prior attempt can't complete someone else's flow.
+- **Security-first defaults**: `CallbackServer` refuses non-loopback binds at the API layer (`LocalBindOnlyError`) — not just a flag — so a bug one level up can't accidentally expose the listener to the LAN. Handler returns 200 **before** parsing (Kite never retries 302s; a 500 would strand the request_token in the user's address bar). Session file refreshes the redaction filter after save so the new `access_token` can't leak into subsequent log lines.
+- **`cmd_login` now has three modes**:
+  - **default**: listener on 127.0.0.1:5000 + auto-capture.
+  - **`--paste`**: original copy/paste flow, for sandboxes / exotic setups.
+  - **SSH-tunneled** (documented, no new flag): `ssh -L 5000:127.0.0.1:5000 user@box` from a laptop or phone; sign in on the laptop's browser; the tunnel carries the callback back to the remote listener. Solves the "log in to a trading box without being at it" use case without any Selenium / credential automation.
+- **New flags on `login`**: `--listen-port PORT` (default 5000), `--timeout SECS` (default 300), `--paste`. `--no-browser` retained.
+- **New doc `docs/LOGIN.md`**: three-mode workflow, SSH tunnel recipe, security properties, troubleshooting.
+- **Test suite**: 731 → 759 tests (+28). New files: `test_oauth_callback.py` (21 tests — happy path, CSRF, timeout, port-in-use, lifecycle, 0.0.0.0 rejection), `test_cmd_login_listener.py` (7 end-to-end tests — real listener + simulated browser + mocked `generate_session`).
+
 ### Unreleased — Wave 4: engine / OMS / risk / persistence
 
 - **MarketDataClient** (`kite_algo/market_data.py`): TTL-cached snapshot wrapper with optional global min-interval throttle. Keyed by `(exchange, symbol)` so two `InstrumentSpec`s with different tokens but the same key share a cache entry. Validates each snapshot (rejects crossed books; allows `bid=None/ask=None` for closed markets).

@@ -56,16 +56,29 @@ Full safety model in `docs/SAFETY.md`.
 
 ## Daily auth flow
 
-Kite's access token expires around 6am IST every morning. No refresh tokens.
+Kite's access token expires daily between **06:45–07:30 IST**. No refresh tokens.
 
-1. `python -m kite_algo.kite_tool login` opens the Kite login URL in your browser
-2. Sign in with Zerodha credentials and 2FA
-3. Kite redirects to your `redirect_uri` with a `request_token`
-4. You paste it back into the CLI (or let a local HTTP listener catch it)
-5. CLI exchanges `request_token` + `api_secret` for an `access_token`
-6. Token gets written to `data/session.json` (gitignored)
+`python -m kite_algo.kite_tool login` supports three modes — local listener (default), remote SSH-tunneled listener, and paste fallback. Full recipes (including how to log in without being at your trading machine) in [`docs/LOGIN.md`](docs/LOGIN.md).
 
-Don't try to automate this with Selenium and TOTP. It's fragile, defeats 2FA, and Zerodha really doesn't like it.
+Quick version:
+
+```bash
+# Default — binds 127.0.0.1:5000, catches Kite's 302 automatically.
+# Your app profile at developers.kite.trade must register http://127.0.0.1:5000/.
+python -m kite_algo.kite_tool login
+
+# Logging in from your laptop while the trading box is remote:
+ssh -L 5000:127.0.0.1:5000 user@trading-box
+# then on the trading box:
+python -m kite_algo.kite_tool login
+# open the printed URL in your laptop's browser → the SSH tunnel delivers
+# the callback to the trading box's listener.
+
+# Paste fallback when the listener can't be reached:
+python -m kite_algo.kite_tool login --paste
+```
+
+Don't try to automate the sign-in itself with Selenium + TOTP. It's fragile, defeats 2FA, is against Zerodha's ToS, and is the thing Zerodha has banned API keys for. The listener above is NOT credential automation — you still sign in manually; we just catch the OAuth callback, the same way `gh auth login` does.
 
 ## Env
 
