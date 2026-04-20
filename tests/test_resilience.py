@@ -11,12 +11,17 @@ import pytest
 from kite_algo.resilience import (
     IdempotentOrderPlacer,
     KiteRateLimiter,
+    ModificationLimitExceeded,
+    OrderbookLookupError,
     RateLimitedKiteClient,
     SlidingWindowLimiter,
     TokenBucket,
     _is_transient_error,
     find_order_by_tag,
+    get_modification_count,
     new_order_tag,
+    record_modification,
+    reset_modification_counts,
     retry_with_backoff,
 )
 
@@ -51,6 +56,47 @@ class TestTokenBucket:
         time.sleep(0.05)
         assert b.acquire(block=False)  # refilled
 
+    def test_rejects_zero_rate(self) -> None:
+        with pytest.raises(ValueError):
+            TokenBucket(rate_per_sec=0)
+
+    def test_rejects_negative_rate(self) -> None:
+        with pytest.raises(ValueError):
+            TokenBucket(rate_per_sec=-1.0)
+
+    def test_rejects_over_capacity_request(self) -> None:
+        b = TokenBucket(rate_per_sec=10.0, capacity=5)
+        with pytest.raises(ValueError):
+            b.acquire(tokens=10)
+
+    def test_deficit_clamp_prevents_huge_wait(self) -> None:
+        """Under floating-point drift, `tokens - _tokens` can be tiny-negative.
+        The clamp to >= 0 keeps `wait` bounded; acquire returns promptly.
+        """
+        b = TokenBucket(rate_per_sec=100.0, capacity=5)
+        # Drain
+        for _ in range(5):
+            b.acquire()
+        # Nudge _tokens to a hair above 1.0 via manual refill math — simulates
+        # the floating-point drift scenario.
+        b._tokens = 1.0 + 1e-15  # type: ignore[attr-defined]
+        # Should still block the next over-budget acquire without exploding.
+        t0 = time.monotonic()
+        b.acquire(tokens=1)  # gets the hair-above-1 token immediately
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.05, f"unexpected wait: {elapsed}"
+
+    def test_wait_never_exceeds_full_refill_window(self) -> None:
+        """Max wait is bounded by capacity/rate, even with weird deficit math."""
+        b = TokenBucket(rate_per_sec=10.0, capacity=5)
+        for _ in range(5):
+            b.acquire()
+        # 6th acquire should wait at most capacity/rate = 0.5s, not seconds.
+        t0 = time.monotonic()
+        b.acquire()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.6, f"acquire took {elapsed}s, expected <0.6s"
+
 
 # ---------------------------------------------------------------------------
 # SlidingWindowLimiter
@@ -82,18 +128,33 @@ class TestSlidingWindowLimiter:
 # ---------------------------------------------------------------------------
 
 class TestKiteRateLimiter:
-    def test_three_buckets_exist(self) -> None:
+    def test_all_buckets_exist(self) -> None:
         lim = KiteRateLimiter()
         assert lim.general.rate == 10.0
         assert lim.historical.rate == 3.0
+        assert lim.quote.rate == 1.0  # per Kite official docs
         assert lim.orders_sec.rate == 10.0
         assert lim.orders_min.max == 200
+        assert lim.orders_day.max == 3000
 
     def test_wait_methods_dont_raise(self) -> None:
         lim = KiteRateLimiter()
         lim.wait_general()
         lim.wait_historical()
+        lim.wait_quote()
         lim.wait_order()
+
+    def test_quote_bucket_is_1_per_sec(self) -> None:
+        """/quote is officially 1 req/s — bucket must reflect that."""
+        lim = KiteRateLimiter()
+        # Drain the quote bucket (capacity=2)
+        lim.quote.acquire()
+        lim.quote.acquire()
+        # Third acquire: must wait ~1s (1 req/s).
+        t0 = time.monotonic()
+        lim.quote.acquire()
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.5, f"quote bucket not throttling: {elapsed}"
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +280,33 @@ class TestFindOrderByTag:
         client.orders.return_value = [{"order_id": "O1", "tag": "DIFF"}]
         assert find_order_by_tag(client, "MISSING") is None
 
-    def test_handles_orderbook_failure(self) -> None:
+    def test_handles_orderbook_failure_raises(self) -> None:
+        """API error must NOT be confused with 'not found'. Raise explicitly
+        so the caller can decide whether to retry place_order or abort.
+        """
         client = Mock()
         client.orders.side_effect = Exception("API down")
-        assert find_order_by_tag(client, "ANY") is None
+        with pytest.raises(OrderbookLookupError):
+            find_order_by_tag(client, "ANY")
+
+    def test_case_insensitive_tag_match(self) -> None:
+        """Some SDK paths normalise tag case; matching must be robust."""
+        client = Mock()
+        client.orders.return_value = [
+            {"order_id": "O1", "tag": "kaabc123"},  # lowercase
+        ]
+        found = find_order_by_tag(client, "KAABC123")
+        assert found is not None
+        assert found["order_id"] == "O1"
+
+    def test_none_tag_row_does_not_crash(self) -> None:
+        """Orderbook rows with tag=None must be skipped, not crash on .upper()."""
+        client = Mock()
+        client.orders.return_value = [
+            {"order_id": "O1", "tag": None},
+            {"order_id": "O2", "tag": "KAX"},
+        ]
+        assert find_order_by_tag(client, "KAX")["order_id"] == "O2"
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +487,59 @@ class TestIdempotentOrderPlacer:
             placer.place(**self._base_args())
         assert client.place_order.call_count == 1
 
+    def test_orderbook_unreachable_does_not_retry_place(self, monkeypatch) -> None:
+        """If the orderbook is unreachable throughout the whole poll window,
+        the placer must NOT retry place_order. It raises OrderbookLookupError
+        so the caller can reconcile later. This prevents double-fills.
+        """
+        import kite_algo.resilience as R
+        monkeypatch.setattr(R, "_ORDERBOOK_POLL_DELAYS", (0.01, 0.01, 0.01, 0.01, 0.01))
+
+        client = Mock()
+        NetworkException = type("NetworkException", (Exception,), {})
+        client.place_order.side_effect = NetworkException("timeout")
+        client.orders.side_effect = Exception("orderbook API down")
+
+        placer = IdempotentOrderPlacer(client)
+
+        with pytest.raises(OrderbookLookupError):
+            placer.place(**self._base_args())
+
+        # place_order was called ONCE. Despite the transient error, we refused
+        # to retry because we could not verify whether the order landed.
+        assert client.place_order.call_count == 1
+
+    def test_orderbook_flaky_but_eventually_works(self, monkeypatch) -> None:
+        """If the orderbook fails a couple of polls but then succeeds with
+        'not found', we should still be allowed to retry place_order.
+        """
+        import kite_algo.resilience as R
+        monkeypatch.setattr(R, "_ORDERBOOK_POLL_DELAYS", (0.01, 0.01, 0.01, 0.01, 0.01))
+
+        client = Mock()
+        NetworkException = type("NetworkException", (Exception,), {})
+
+        # place_order: transient first, success second.
+        client.place_order.side_effect = [
+            NetworkException("timeout"),
+            "ORD_OK",
+        ]
+
+        # orders(): error, error, empty, empty, empty → final retry succeeds.
+        call = {"n": 0}
+        def orders_sfx():
+            call["n"] += 1
+            if call["n"] <= 2:
+                raise Exception("flaky")
+            return []
+        client.orders.side_effect = orders_sfx
+
+        placer = IdempotentOrderPlacer(client)
+        order_id = placer.place(**self._base_args())
+
+        assert order_id == "ORD_OK"
+        assert client.place_order.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # TokenBucket thread-safety
@@ -489,7 +626,7 @@ class TestRateLimitedKiteClient:
         raw.place_order.return_value = "ORD_1"
         rl = KiteRateLimiter()
 
-        bucket_hits = {"order": 0, "general": 0, "historical": 0}
+        bucket_hits = {"order": 0, "general": 0, "historical": 0, "quote": 0}
         def track(name):
             orig = getattr(rl, name)
             def wrapper():
@@ -499,16 +636,71 @@ class TestRateLimitedKiteClient:
         rl.wait_order = track("wait_order")
         rl.wait_general = track("wait_general")
         rl.wait_historical = track("wait_historical")
+        rl.wait_quote = track("wait_quote")
 
         client = RateLimitedKiteClient(raw, rl)
         client.place_order(variety="regular", tradingsymbol="RELIANCE")
         client.profile()
-        # historical_data is the only historical-bucket method
         raw.historical_data.return_value = []
         client.historical_data(instrument_token=1, from_date=1, to_date=2, interval="day")
 
-        # wait_order is called for place_order, wait_general for profile,
-        # wait_historical for historical_data.
         assert bucket_hits["order"] == 1
         assert bucket_hits["historical"] == 1
         assert bucket_hits["general"] >= 1
+
+    def test_quote_methods_use_quote_bucket(self) -> None:
+        """ltp/ohlc/quote must route to the 1-req/s quote bucket, not general."""
+        raw = Mock()
+        raw.ltp.return_value = {}
+        raw.ohlc.return_value = {}
+        raw.quote.return_value = {}
+        rl = KiteRateLimiter()
+
+        hits = {"quote": 0, "general": 0}
+        def track(name):
+            orig = getattr(rl, name)
+            def w():
+                hits[name.replace("wait_", "")] += 1
+                return orig()
+            return w
+        rl.wait_quote = track("wait_quote")
+        rl.wait_general = track("wait_general")
+
+        client = RateLimitedKiteClient(raw, rl)
+        client.ltp(["NSE:RELIANCE"])
+        client.ohlc(["NSE:RELIANCE"])
+        client.quote(["NSE:RELIANCE"])
+
+        # Each of the three methods hits the quote bucket.
+        assert hits["quote"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Modification counter
+# ---------------------------------------------------------------------------
+
+class TestModificationCounter:
+    def setup_method(self):
+        reset_modification_counts()
+
+    def test_first_mod_returns_1(self) -> None:
+        assert record_modification("ORD_1") == 1
+
+    def test_counts_are_per_order_id(self) -> None:
+        record_modification("A")
+        record_modification("A")
+        record_modification("B")
+        assert get_modification_count("A") == 2
+        assert get_modification_count("B") == 1
+        assert get_modification_count("MISSING") == 0
+
+    def test_raises_at_cap(self) -> None:
+        for _ in range(20):
+            record_modification("O")
+        with pytest.raises(ModificationLimitExceeded):
+            record_modification("O")
+
+    def test_reset_clears_state(self) -> None:
+        record_modification("X")
+        reset_modification_counts()
+        assert get_modification_count("X") == 0

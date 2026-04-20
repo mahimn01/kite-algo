@@ -63,6 +63,7 @@ class SimBroker:
             high=price,
             low=price,
             close=price,
+            market_closed=False,
         )
 
     def get_historical_bars(

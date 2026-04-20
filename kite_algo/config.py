@@ -1,17 +1,23 @@
 """Configuration dataclasses with safety rails.
 
 Mirrors the `trading_algo.config` module's shape so the broker interfaces line
-up across repos, but specialized for Kite Connect's daily-rotating access
+up across repos, but specialised for Kite Connect's daily-rotating access
 tokens and Indian market segments.
+
+Hardened for enterprise use:
+- `_env_bool` is strict: unknown values raise, not silently treated as False.
+- `save_session` is atomic: O_CREAT|O_EXCL|O_WRONLY at 0o600, then os.rename.
+  No TOCTOU window where the file is world-readable.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 
 # -----------------------------------------------------------------------------
@@ -38,25 +44,118 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default) or default
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSY = frozenset({"0", "false", "no", "off", "n", "f", ""})
+
+
+class EnvParseError(ValueError):
+    """Raised when an env var is set but cannot be parsed.
+
+    Never silently defaulted — a typo on a safety-critical env var must fail
+    loud, not quietly flip behaviour.
+    """
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
+    """Strict env-bool parser.
+
+    Unset → `default`. Set to anything in `_TRUTHY` or `_FALSY` → explicit.
+    Anything else → `EnvParseError`. This matters for safety flags like
+    `TRADING_ALLOW_LIVE` where a typo must never be silently interpreted.
+    """
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    norm = raw.strip().lower()
+    if norm in _TRUTHY:
+        return True
+    if norm in _FALSY:
+        return False
+    raise EnvParseError(
+        f"Env var {name}={raw!r} is not a recognised boolean. "
+        f"Use one of: {sorted(_TRUTHY | _FALSY - {''})}. "
+        f"Unset the var to get the default ({default})."
+    )
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name) or default)
-    except ValueError:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
         return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise EnvParseError(f"Env var {name}={raw!r} is not a float: {exc}") from exc
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name) or default)
-    except ValueError:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
         return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise EnvParseError(f"Env var {name}={raw!r} is not an int: {exc}") from exc
+
+
+# -----------------------------------------------------------------------------
+# Atomic write helpers
+# -----------------------------------------------------------------------------
+
+def atomic_write_text(path: Path, data: str, *, mode: int = 0o600) -> None:
+    """Atomically write `data` to `path` with the given file mode.
+
+    Writes to a temp file in the same directory, fsyncs, then renames over the
+    target. Guarantees:
+    - No partial-write state visible on filesystem (rename is atomic on POSIX).
+    - Temp file is created with `mode` permissions from the start (no TOCTOU
+      window where another process could read a world-readable version).
+    - Parent directory is created with 0o700 if missing.
+
+    On Windows rename is best-effort (replace existing); mode is a no-op.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Restrict parent mode too on POSIX — mkdir(mode=0o700) only applies if it
+    # didn't already exist, so defensively chmod here as well.
+    if os.name == "posix":
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+
+    # NamedTemporaryFile with delete=False so we can rename.  dir= ensures the
+    # temp is on the same filesystem as the target (required for atomic rename).
+    fd = None
+    tmp_name = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        if os.name == "posix":
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None  # fdopen took ownership
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # fsync not supported on some FS (e.g. some network mounts)
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name is not None and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -67,7 +166,12 @@ DEFAULT_SESSION_PATH = Path("data/session.json")
 
 
 def load_session(path: Path = DEFAULT_SESSION_PATH) -> dict:
-    """Load the cached Kite session (access_token + metadata)."""
+    """Load the cached Kite session (access_token + metadata).
+
+    Returns `{}` on missing or malformed file. The caller treats that as
+    "no session — run login". We never raise on decode errors because a
+    half-written file from a crashed `login` shouldn't block recovery.
+    """
     if not path.exists():
         return {}
     try:
@@ -77,18 +181,13 @@ def load_session(path: Path = DEFAULT_SESSION_PATH) -> dict:
 
 
 def save_session(data: dict, path: Path = DEFAULT_SESSION_PATH) -> None:
-    """Write session with owner-only permissions (the file contains a live
-    access token valid for the rest of the trading day).
+    """Write session atomically at mode 0o600.
+
+    The file contains a live access token valid for the rest of the trading
+    day.  Atomic rename guarantees the file is never visible in a truncated
+    state even if the process is killed mid-write.
     """
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Write then chmod. On POSIX the file is created with umask; we immediately
-    # restrict to 0600. On Windows chmod is a no-op but the directory ACLs
-    # should already restrict non-owner access.
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    atomic_write_text(path, json.dumps(data, indent=2), mode=0o600)
 
 
 def get_access_token() -> str:
@@ -143,7 +242,8 @@ class KiteConfig:
         if not self.access_token:
             raise SystemExit(
                 "No Kite access_token found. Run `python -m kite_algo.kite_tool "
-                "login` to authenticate (tokens rotate at ~6am IST daily)."
+                "login` to authenticate (tokens rotate daily between 06:45 and "
+                "07:30 IST)."
             )
 
 
