@@ -27,14 +27,21 @@ class TestHappyPath:
         assert validate_order(**_base()) == []
 
     def test_valid_equity_market(self) -> None:
-        assert validate_order(**_base(order_type="MARKET", price=None)) == []
+        # MARKET requires market_protection post-SEBI April 2026; -1 = Kite auto.
+        assert validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=-1,
+        )) == []
 
     def test_valid_sl_order(self) -> None:
         errs = validate_order(**_base(order_type="SL", price=1340.0, trigger_price=1335.0))
         assert errs == []
 
     def test_valid_sl_m_order(self) -> None:
-        errs = validate_order(**_base(order_type="SL-M", price=None, trigger_price=1335.0))
+        # SL-M also requires market_protection (SEBI Apr 2026).
+        errs = validate_order(**_base(
+            order_type="SL-M", price=None, trigger_price=1335.0,
+            market_protection=-1,
+        ))
         assert errs == []
 
     def test_valid_fno_nrml(self) -> None:
@@ -49,8 +56,10 @@ class TestHappyPath:
         assert errs == []
 
     def test_valid_iceberg(self) -> None:
+        # Iceberg is only supported on MIS/NRML, not CNC — use NFO+NRML for a
+        # representative realistic leg.
         errs = validate_order(**_base(
-            variety="iceberg", quantity=1000,
+            variety="iceberg", product="NRML", exchange="NFO", quantity=1000,
             iceberg_legs=5, iceberg_quantity=200,
         ))
         assert errs == []
@@ -156,25 +165,35 @@ class TestValidityRules:
 
 class TestIcebergRules:
     def test_iceberg_requires_legs(self) -> None:
-        errs = validate_order(**_base(variety="iceberg", quantity=1000))
+        errs = validate_order(**_base(variety="iceberg", quantity=1000, product="NRML", exchange="NFO"))
         assert any(e.field == "iceberg_legs" for e in errs)
 
-    def test_iceberg_legs_bounds(self) -> None:
+    def test_iceberg_legs_bounds_post_sebi_10(self) -> None:
+        """Post SEBI April 2026: iceberg max legs is 10, down from 50."""
+        # 1 leg → too few
         errs = validate_order(**_base(
-            variety="iceberg", quantity=1000,
+            variety="iceberg", quantity=1000, product="NRML", exchange="NFO",
             iceberg_legs=1, iceberg_quantity=1000,
         ))
         assert any(e.field == "iceberg_legs" for e in errs)
 
+        # 11 legs → too many (post-SEBI ceiling is 10)
         errs2 = validate_order(**_base(
-            variety="iceberg", quantity=5000,
-            iceberg_legs=100, iceberg_quantity=50,
+            variety="iceberg", quantity=1100, product="NRML", exchange="NFO",
+            iceberg_legs=11, iceberg_quantity=100,
         ))
         assert any(e.field == "iceberg_legs" for e in errs2)
 
+        # 10 legs → accepted
+        errs3 = validate_order(**_base(
+            variety="iceberg", quantity=1000, product="NRML", exchange="NFO",
+            iceberg_legs=10, iceberg_quantity=100,
+        ))
+        assert errs3 == []
+
     def test_iceberg_legs_x_quantity_must_equal_total(self) -> None:
         errs = validate_order(**_base(
-            variety="iceberg", quantity=1000,
+            variety="iceberg", quantity=1000, product="NRML", exchange="NFO",
             iceberg_legs=5, iceberg_quantity=100,  # 5×100=500 ≠ 1000
         ))
         assert any(e.field == "iceberg_quantity" for e in errs)
@@ -182,6 +201,21 @@ class TestIcebergRules:
     def test_non_iceberg_rejects_iceberg_params(self) -> None:
         errs = validate_order(**_base(iceberg_legs=5))
         assert any("iceberg" in e.field for e in errs)
+
+    def test_iceberg_rejected_on_cnc(self) -> None:
+        """Iceberg is for MIS/NRML only — not delivery products."""
+        errs = validate_order(**_base(
+            variety="iceberg", product="CNC", exchange="NSE",
+            quantity=1000, iceberg_legs=5, iceberg_quantity=200,
+        ))
+        assert any(e.field == "product" and "iceberg" in e.message for e in errs)
+
+    def test_iceberg_rejected_on_mtf(self) -> None:
+        errs = validate_order(**_base(
+            variety="iceberg", product="MTF", exchange="NSE",
+            quantity=1000, iceberg_legs=5, iceberg_quantity=200,
+        ))
+        assert any(e.field == "product" and "iceberg" in e.message for e in errs)
 
 
 class TestDisclosedQuantity:
@@ -206,6 +240,64 @@ class TestTagRules:
     def test_tag_non_alphanumeric(self) -> None:
         errs = validate_order(**_base(tag="foo@bar"))
         assert any(e.field == "tag" for e in errs)
+
+
+class TestMarketProtection:
+    """SEBI April 2026 mandatory field for MARKET/SL-M orders."""
+
+    def test_market_order_requires_market_protection(self) -> None:
+        errs = validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=None,
+        ))
+        assert any(e.field == "market_protection" for e in errs)
+
+    def test_slm_order_requires_market_protection(self) -> None:
+        errs = validate_order(**_base(
+            order_type="SL-M", price=None, trigger_price=1000,
+            market_protection=None,
+        ))
+        assert any(e.field == "market_protection" for e in errs)
+
+    def test_auto_value_minus_one_accepted(self) -> None:
+        errs = validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=-1,
+        ))
+        assert errs == []
+
+    def test_positive_percent_accepted(self) -> None:
+        errs = validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=1.5,
+        ))
+        assert errs == []
+
+    def test_zero_rejected(self) -> None:
+        """market_protection=0 is exactly what Kite rejects post-SEBI."""
+        errs = validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=0,
+        ))
+        assert any(e.field == "market_protection" for e in errs)
+
+    def test_negative_other_than_minus_one_rejected(self) -> None:
+        errs = validate_order(**_base(
+            order_type="MARKET", price=None, market_protection=-2,
+        ))
+        assert any(e.field == "market_protection" for e in errs)
+
+    def test_limit_order_rejects_market_protection(self) -> None:
+        """LIMIT has an explicit price — market_protection is meaningless."""
+        errs = validate_order(**_base(
+            order_type="LIMIT", price=100.0, market_protection=1.0,
+        ))
+        assert any(e.field == "market_protection" for e in errs)
+
+    def test_limit_order_allows_minus_one_passthrough(self) -> None:
+        """CLI always passes -1 as the default; LIMIT orders ignore it rather
+        than error.
+        """
+        errs = validate_order(**_base(
+            order_type="LIMIT", price=100.0, market_protection=-1,
+        ))
+        assert errs == []
 
 
 class TestQuantityRules:

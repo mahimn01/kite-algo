@@ -84,19 +84,28 @@ TRADING_DRY_RUN=true
 | Component | Status |
 |---|---|
 | Package skeleton + config | done |
-| `kite_tool` CLI parser | done |
-| Auth and login flow | wip |
-| Read-only commands (profile, margins, holdings, quotes, history) | wip |
-| `KiteBroker` adapter | stub |
-| Order placement | stub |
-| GTT commands | stub |
-| WebSocket streaming | stub |
-| Options chain with local Greeks | stub |
-| Engine/OMS/risk loop | stub |
-| Strategies | planned |
-| Instruments cache | planned |
-| Backtesting | planned |
-| Tests | planned |
+| `kite_tool` CLI parser (68 subcommands) | done |
+| Auth + daily-rotation login flow | done |
+| Read-only commands (profile, margins, holdings, quotes, history, chain, ...) | done |
+| `KiteBroker` adapter (read + write) | done |
+| Order placement (validated, idempotent, rate-limited) | done |
+| GTT commands (list/get/create/modify/delete, single + OCO) | done |
+| WebSocket streaming (with `--buffer-to` + `tail-ticks`) | done |
+| Options chain with local BSM Greeks | done |
+| Engine / OMS / Risk / Persistence | done |
+| Kill switch (`halt` / `resume`) | done |
+| Structured envelope + exit-code taxonomy | done |
+| SEBI-compliant audit log (`data/audit/*.jsonl`) + `events` | done |
+| Multi-leg transaction groups + `reconcile` | done |
+| Alerts API (raw HTTP) | done |
+| Instruments cache (daily dump, atomic writes) | done |
+| Market-hours + freeze-qty + lot-size + MIS-cutoff guards | done |
+| `market_protection` plumbed (SEBI April 2026) | done |
+| `status`, `watch`, `time`, `tools-describe` agent commands | done |
+| `--idempotency-key` crash-safe replay cache | done |
+| Strategies (agent-driven; no in-repo strategies) | out of scope |
+| Backtesting | out of scope |
+| Tests (731 passing) | done |
 
 ## Related
 

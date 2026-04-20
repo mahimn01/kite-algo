@@ -38,6 +38,14 @@ data/reports/
 ibkr_data_cache/
 kite_data_cache/
 
+# Runtime state written by the engine / audit log / kill switch
+data/audit/
+data/idempotency.sqlite
+data/idempotency.sqlite-*
+data/trading.sqlite
+data/trading.sqlite-*
+data/HALTED
+
 # Notebooks
 .ipynb_checkpoints/
 

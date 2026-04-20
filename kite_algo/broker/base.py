@@ -71,18 +71,31 @@ class Bar:
 
 @dataclass(frozen=True)
 class MarketDataSnapshot:
+    """Snapshot of live market state for one instrument.
+
+    Fields that may be absent are typed `float | None`.  Kite returns 0 for
+    `bid`/`ask` when the market is closed or depth is unavailable — we
+    explicitly translate that to `None` so callers cannot accidentally price
+    trades against a zero spread.
+
+    Use `market_closed` to reason about why bid/ask may be None: Kite
+    returns a partial snapshot even when the market is shut (LTP = prior
+    close, no depth).  An agent reading this should never place a LIMIT
+    order priced against `bid=None`.
+    """
     instrument: InstrumentSpec
-    last: float
-    bid: float
-    ask: float
+    last: float | None
+    bid: float | None
+    ask: float | None
     volume: int
-    open: float
-    high: float
-    low: float
-    close: float
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float | None
     ohlc: dict = field(default_factory=dict)
     depth: dict = field(default_factory=dict)
     oi: int | None = None
+    market_closed: bool = False
 
 
 @dataclass(frozen=True)

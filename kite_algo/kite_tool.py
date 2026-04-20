@@ -40,28 +40,44 @@ from kite_algo.logging_setup import configure_logging
 from kite_algo.resilience import (
     IdempotentOrderPlacer,
     KiteRateLimiter,
+    ModificationLimitExceeded,
     RateLimitedKiteClient,
     find_order_by_tag,
     new_order_tag,
+    record_modification,
     retry_with_backoff,
 )
+from kite_algo.halt import (
+    assert_not_halted,
+    clear_halt,
+    parse_duration,
+    read_halt,
+    write_halt,
+)
+from kite_algo.idempotency import (
+    IdempotencyStore,
+    derive_tag_from_key,
+)
+from kite_algo.market_rules import check_market_rules
+from kite_algo.projection import (
+    parse_fields,
+    project_rows,
+    summarize_holdings,
+    summarize_option_chain,
+    summarize_orders,
+    summarize_positions,
+)
+from kite_algo.redaction import install_logging_filter, redact_text
 from kite_algo.validation import format_errors, validate_order
 
 
 def _redact_secrets(text: str) -> str:
-    """Strip api_secret/access_token from error strings before printing.
+    """Redact secrets from any text about to hit stderr/stdout/logs.
 
-    Kite SDK errors occasionally echo request payload fields.
+    Thin alias over `kite_algo.redaction.redact_text`. Kept as a module-level
+    function for backwards-compat with existing call sites.
     """
-    try:
-        cfg = KiteConfig.from_env()
-    except Exception:
-        return text
-    out = text
-    for secret in (cfg.api_secret, cfg.access_token):
-        if secret and len(secret) > 8:
-            out = out.replace(secret, "***REDACTED***")
-    return out
+    return redact_text(text)
 
 
 # -----------------------------------------------------------------------------
@@ -70,6 +86,10 @@ def _redact_secrets(text: str) -> str:
 
 load_dotenv()
 configure_logging(level=logging.INFO if os.getenv("KITE_DEBUG") else logging.WARNING)
+# Install the secret-redacting filter at the root logger BEFORE any module
+# emits its first log line. Third-party SDKs (kiteconnect, urllib3) log via
+# their own loggers; the root filter intercepts everything.
+install_logging_filter()
 log = logging.getLogger("kite_tool")
 
 _RATE_LIMITER = KiteRateLimiter()
@@ -118,10 +138,78 @@ def _to_jsonable(obj: Any) -> Any:
     return str(obj)
 
 
-def _emit(data: Any, fmt: str) -> None:
+def _resolve_format(fmt: str) -> str:
+    """Resolve `auto` to `json` when stdout is not a TTY, `table` otherwise.
+
+    Rule of thumb for an agent-driven CLI:
+    - Piped / subprocess / agent invocation → JSON envelope.
+    - Interactive human in a terminal → table.
+    Override via `--format json|csv|table` or `KITE_JSON=1` env.
+    """
+    if fmt == "auto":
+        from kite_algo.envelope import json_is_default_for
+        return "json" if json_is_default_for() else "table"
+    return fmt
+
+
+def _emit(
+    data: Any,
+    fmt: str,
+    *,
+    cmd: str | None = None,
+    env: Any = None,
+    warnings: list[dict] | None = None,
+) -> None:
+    """Emit `data` to stdout in the requested format.
+
+    When `fmt` resolves to `json` and `cmd` is provided (and the escape-hatch
+    `KITE_NO_ENVELOPE` is not set), `data` is wrapped in the canonical
+    envelope (`kite_algo.envelope`):
+
+        {ok, cmd, schema_version, request_id, data, warnings, meta}
+
+    Agents key off the envelope to detect partial outputs, propagate trace
+    IDs, and branch on success vs error without regex-parsing text. Humans
+    using `--format table` still get plain column-aligned output.
+
+    For non-wrapped modes (csv, table, or `KITE_NO_ENVELOPE=1`), `data` is
+    emitted as before.
+
+    `env` is an optional pre-built Envelope (from a `with_error_envelope`
+    decorator). When supplied, we reuse its `request_id` and warnings; this
+    preserves the trace ID across an entire command's execution rather than
+    minting a fresh one at emission time.
+    """
+    from kite_algo.envelope import (
+        envelope_to_json,
+        envelopes_disabled,
+        finalize_envelope,
+        new_envelope,
+    )
+
+    fmt = _resolve_format(fmt)
+
+    if fmt == "json" and cmd is not None and not envelopes_disabled():
+        # Envelope path: build or reuse, then serialise with full meta.
+        if env is None:
+            env_obj = new_envelope(cmd)
+        else:
+            env_obj = env
+        env_obj.data = _to_jsonable(data)
+        if warnings:
+            for w in warnings:
+                if isinstance(w, dict):
+                    env_obj.warnings.append(w)
+        finalize_envelope(env_obj)
+        print(envelope_to_json(env_obj))
+        return
+
     if fmt == "json":
+        # Raw-JSON mode: envelope disabled or cmd not provided. Still safe
+        # for scripts that opted out of the envelope; they get the bare data.
         print(json.dumps(_to_jsonable(data), indent=2, default=str))
         return
+
     if fmt == "csv":
         rows = data if isinstance(data, list) else [data]
         rows = [_to_jsonable(r) for r in rows if r is not None]
@@ -134,7 +222,8 @@ def _emit(data: Any, fmt: str) -> None:
         for r in rows:
             writer.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in keys})
         return
-    # table
+
+    # table (default for interactive terminals)
     rows = data if isinstance(data, list) else [data]
     rows = [_to_jsonable(r) for r in rows if r is not None]
     if not rows:
@@ -233,13 +322,13 @@ def cmd_login(args: argparse.Namespace) -> int:
     }
     save_session(session)
     print(f"\nAccess token saved to {DEFAULT_SESSION_PATH}", file=sys.stderr)
-    _emit({k: v for k, v in session.items() if k not in ("access_token", "public_token")}, args.format)
+    _emit({k: v for k, v in session.items() if k not in ("access_token", "public_token")}, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.profile(), args.format)
+    _emit(client.profile(), args.format, cmd=args.cmd)
     return 0
 
 
@@ -268,7 +357,7 @@ def cmd_session(args: argparse.Namespace) -> int:
         "expires_approx_ist": expires_hint,
         "access_token_present": bool(data.get("access_token")),
     }
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -292,7 +381,7 @@ def cmd_health(args: argparse.Namespace) -> int:
     record("session_file", bool(sess), DEFAULT_SESSION_PATH.name if sess else "missing — run `login`")
 
     if not sess:
-        _emit(checks, args.format)
+        _emit(checks, args.format, cmd=args.cmd)
         return 1
 
     # 2. Credentials in env
@@ -306,7 +395,7 @@ def cmd_health(args: argparse.Namespace) -> int:
         record("api_reachable", True, f"user={profile.get('user_id')}")
     except Exception as exc:
         record("api_reachable", False, f"{type(exc).__name__}: {exc}")
-        _emit(checks, args.format)
+        _emit(checks, args.format, cmd=args.cmd)
         return 1
 
     # 4. Margins endpoint
@@ -333,8 +422,940 @@ def cmd_health(args: argparse.Namespace) -> int:
     except Exception as exc:
         record("instruments_cache", False, str(exc))
 
-    _emit(checks, args.format)
+    _emit(checks, args.format, cmd=args.cmd)
     return 0 if overall_ok else 1
+
+
+# =============================================================================
+# TAIL-TICKS — read from a buffer written by `stream --buffer-to`
+# =============================================================================
+
+def cmd_tail_ticks(args: argparse.Namespace) -> int:
+    """Read buffered WebSocket ticks from a file previously populated by
+    `kite-algo stream --buffer-to FILE`.
+
+    Output is NDJSON (one tick per line) — same shape as `stream` emits to
+    stdout. Supports resume via `--from-seq N` so an agent that crashed at
+    sequence N can pick up with sequence N+1. Separate process from the
+    live stream; the streamer keeps the file open append-mode while any
+    number of tail-ticks readers can consume concurrently.
+
+    `--follow` behaves like `tail -f` — keeps reading as new lines arrive.
+    Without `--follow` we return once the current file is exhausted.
+    """
+    path = Path(args.path)
+    if not path.exists():
+        print(f"ERROR: no such file: {path}", file=sys.stderr)
+        return 1
+
+    def _filter_pass(tick: dict) -> bool:
+        if args.symbols:
+            want = set(_split_symbols(args.symbols))
+            # Ticks may carry tradingsymbol or instrument_token; symbols can
+            # be either 'NSE:RELIANCE' or just 'RELIANCE'.
+            sym = tick.get("tradingsymbol") or ""
+            token = str(tick.get("instrument_token") or "")
+            if not (sym in want or token in want):
+                return False
+        if args.from_seq is not None:
+            seq = tick.get("_seq", 0)
+            if seq < args.from_seq:
+                return False
+        return True
+
+    count = 0
+    limit = args.limit or 0
+
+    def _emit_line(line: str) -> None:
+        nonlocal count
+        try:
+            tick = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not _filter_pass(tick):
+            return
+        try:
+            print(json.dumps(tick, default=str), flush=True)
+        except BrokenPipeError:
+            raise
+        count += 1
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            # Drain existing lines.
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                _emit_line(line)
+                if limit and count >= limit:
+                    return 0
+            if args.follow:
+                while True:
+                    where = f.tell()
+                    line = f.readline()
+                    if not line:
+                        time.sleep(args.poll_interval)
+                        f.seek(where)
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    _emit_line(line)
+                    if limit and count >= limit:
+                        return 0
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+    return 0
+
+
+# =============================================================================
+# ALERTS (raw HTTP — pykiteconnect does not wrap this endpoint)
+# =============================================================================
+
+def _new_alerts_client() -> Any:
+    """Build an AlertsClient with session credentials + rate limiter."""
+    from kite_algo.alerts import AlertsClient
+    cfg = KiteConfig.from_env()
+    cfg.require_session()
+    return AlertsClient(
+        api_key=cfg.api_key,
+        access_token=cfg.access_token,
+        rate_limiter=_RATE_LIMITER,
+    )
+
+
+def cmd_alerts_list(args: argparse.Namespace) -> int:
+    client = _new_alerts_client()
+    data = client.list(status=args.status, page=args.page, page_size=args.page_size)
+    _emit(data, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_alerts_get(args: argparse.Namespace) -> int:
+    client = _new_alerts_client()
+    data = client.get(args.uuid)
+    _emit(data, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_alerts_create(args: argparse.Namespace) -> int:
+    _require_yes(args, "create an alert")
+    _require_not_halted("create an alert")
+    client = _new_alerts_client()
+
+    payload: dict[str, Any] = {
+        "name": args.name,
+        "type": args.type,
+        "lhs_exchange": args.lhs_exchange,
+        "lhs_tradingsymbol": args.lhs_tradingsymbol,
+        "lhs_attribute": args.lhs_attribute,
+        "operator": args.operator,
+        "rhs_type": args.rhs_type,
+    }
+    if args.rhs_type == "constant":
+        payload["rhs_constant"] = args.rhs_constant
+    else:
+        payload["rhs_exchange"] = args.rhs_exchange
+        payload["rhs_tradingsymbol"] = args.rhs_tradingsymbol
+        payload["rhs_attribute"] = args.rhs_attribute
+    if args.type == "ato":
+        if not args.basket_json:
+            print("ERROR: type=ato requires --basket-json", file=sys.stderr)
+            return 2
+        try:
+            payload["basket"] = json.loads(args.basket_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: --basket-json parse failed: {exc}", file=sys.stderr)
+            return 2
+    try:
+        data = client.create(payload)
+    except Exception as exc:
+        print(f"ERROR: alerts create failed: {redact_text(str(exc))}", file=sys.stderr)
+        return 1
+    _emit(data, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_alerts_modify(args: argparse.Namespace) -> int:
+    _require_yes(args, "modify an alert")
+    _require_not_halted("modify an alert")
+    client = _new_alerts_client()
+
+    payload: dict[str, Any] = {}
+    for attr in ("name", "operator", "rhs_type", "lhs_attribute", "type",
+                 "lhs_exchange", "lhs_tradingsymbol",
+                 "rhs_exchange", "rhs_tradingsymbol", "rhs_attribute"):
+        v = getattr(args, attr, None)
+        if v is not None:
+            payload[attr] = v
+    if args.rhs_constant is not None:
+        payload["rhs_constant"] = args.rhs_constant
+    if args.basket_json is not None:
+        try:
+            payload["basket"] = json.loads(args.basket_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: --basket-json parse failed: {exc}", file=sys.stderr)
+            return 2
+
+    data = client.modify(args.uuid, payload)
+    _emit(data, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_alerts_delete(args: argparse.Namespace) -> int:
+    _require_yes(args, "delete an alert")
+    _require_not_halted("delete an alert")
+    client = _new_alerts_client()
+    data = client.delete(args.uuid)
+    _emit({"deleted": args.uuid, "response": data}, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_alerts_history(args: argparse.Namespace) -> int:
+    client = _new_alerts_client()
+    data = client.history(args.uuid)
+    _emit(data, args.format, cmd=args.cmd)
+    return 0
+
+
+# =============================================================================
+# RECONCILE — diff local state vs Kite server state
+# =============================================================================
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Diff: what we THINK we did (local audit + idempotency store) vs what
+    Kite ACTUALLY has (orders/trades). Emits four buckets:
+
+      missing_remotely  — we have a record with a kite_order_id that no
+                          longer appears on Kite's orderbook. Possible
+                          causes: order already terminal and cleaned up,
+                          or cancelled by the user outside our CLI.
+      missing_locally   — Kite has an order our local records don't know
+                          about. Happens if another agent / device / human
+                          placed the order, or if our audit log was
+                          truncated.
+      mismatched        — local status ≠ live status. Usually just means
+                          the live state has advanced past what we recorded.
+      orphan_groups     — groups whose legs have fewer entries than
+                          `expected_legs` — a crashed multi-leg transaction.
+
+    Exit code: 0 if everything matches, 1 if any drift detected, 5 if the
+    session is invalid.
+    """
+    from kite_algo.audit import iter_entries
+    from datetime import date
+
+    since = None
+    if args.since:
+        try:
+            since = date.fromisoformat(args.since)
+        except ValueError:
+            print(f"ERROR: --since must be YYYY-MM-DD: {args.since!r}",
+                  file=sys.stderr)
+            return 2
+
+    # 1. Gather local view: every successful place we've logged that
+    #    produced a kite_order_id.
+    local_orders: dict[str, dict] = {}
+    for entry in iter_entries(since=since, cmd="place"):
+        oid = entry.get("kite_order_id")
+        if oid:
+            local_orders[str(oid)] = entry
+
+    # 2. Also look at the idempotency store for any `place` rows that
+    #    completed — these are the most recent source of truth for
+    #    kite_order_id since they survive crashes between API-return and
+    #    audit-write.
+    from kite_algo.idempotency import IdempotencyStore
+    idem = IdempotencyStore()
+    try:
+        import sqlite3
+        with idem._conn() as c:
+            for row in c.execute(
+                "SELECT kite_order_id, key, cmd, result_json FROM writes "
+                "WHERE cmd='place' AND kite_order_id IS NOT NULL",
+            ).fetchall():
+                oid = str(row[0])
+                local_orders.setdefault(oid, {
+                    "kite_order_id": oid,
+                    "source": "idempotency",
+                    "idempotency_key": row[1],
+                })
+    except Exception as exc:
+        log.warning("idempotency snapshot failed: %s", redact_text(str(exc)))
+
+    # 3. Fetch Kite's live state.
+    if getattr(args, "skip_kite", False):
+        kite_orders: list[dict] = []
+    else:
+        try:
+            client = _new_client()
+            kite_orders = list(client.orders() or [])
+        except Exception as exc:
+            cls = type(exc).__name__
+            # Session errors are the common case — make the exit code
+            # reflect that distinctly.
+            if cls in ("TokenException", "KiteSessionError"):
+                print(f"ERROR: session invalid: {redact_text(str(exc))}",
+                      file=sys.stderr)
+                return 5
+            raise
+
+    remote_map: dict[str, dict] = {
+        str(o.get("order_id")): o for o in kite_orders
+    }
+
+    missing_remotely = [
+        {"order_id": oid, "local": local_orders[oid]}
+        for oid in local_orders
+        if oid not in remote_map
+    ]
+    missing_locally = [
+        {"order_id": oid, "status": o.get("status"),
+         "tradingsymbol": o.get("tradingsymbol"),
+         "transaction_type": o.get("transaction_type"),
+         "quantity": o.get("quantity"),
+         "tag": o.get("tag")}
+        for oid, o in remote_map.items()
+        if oid not in local_orders
+    ]
+    mismatched = []
+    for oid, local in local_orders.items():
+        if oid not in remote_map:
+            continue
+        live = remote_map[oid]
+        live_status = live.get("status")
+        # Local view carries the status at the time of the write. Live status
+        # advancing (OPEN → COMPLETE) is expected and benign; we only flag
+        # when both sides carry terminal statuses that differ.
+        local_status = None
+        if isinstance(local.get("args"), dict):
+            # The audit stores the request, not the result status; so we
+            # can only compare if the idempotency row had a stored result.
+            pass
+        if local.get("result_json"):
+            try:
+                local_status = (
+                    (__import__('json').loads(local["result_json"]) or {})
+                    .get("final_status")
+                )
+            except Exception:
+                pass
+        if local_status and live_status and local_status != live_status:
+            if (local_status in ("COMPLETE", "REJECTED", "CANCELLED")
+                    and live_status in ("COMPLETE", "REJECTED", "CANCELLED")
+                    and local_status != live_status):
+                mismatched.append({
+                    "order_id": oid,
+                    "local_status": local_status,
+                    "live_status": live_status,
+                })
+
+    # 4. Orphan groups — started but have fewer actual members than expected.
+    from kite_algo.groups import GroupStore
+    store = GroupStore()
+    orphan_groups = []
+    for g in store.list_active():
+        members = store.members(g.id)
+        if g.expected_legs is not None and len(members) < g.expected_legs:
+            orphan_groups.append({
+                "group_id": g.id,
+                "name": g.name,
+                "expected_legs": g.expected_legs,
+                "actual_legs": len(members),
+                "age_ms": int(time.time() * 1000) - g.created_at_ms,
+            })
+
+    drift = bool(missing_remotely or missing_locally or mismatched or orphan_groups)
+
+    out = {
+        "clean": not drift,
+        "missing_remotely": missing_remotely,
+        "missing_locally": missing_locally,
+        "mismatched": mismatched,
+        "orphan_groups": orphan_groups,
+        "totals": {
+            "local_orders": len(local_orders),
+            "remote_orders": len(remote_map),
+            "missing_remotely": len(missing_remotely),
+            "missing_locally": len(missing_locally),
+            "mismatched": len(mismatched),
+            "orphan_groups": len(orphan_groups),
+        },
+    }
+    _emit(out, args.format, cmd=args.cmd)
+    return 0 if not drift else 1
+
+
+# =============================================================================
+# GROUPS — multi-leg transactions
+# =============================================================================
+
+def cmd_group_start(args: argparse.Namespace) -> int:
+    """Begin a new multi-leg transaction. Returns the group_id an agent
+    attaches to subsequent `place --group-id G` calls.
+    """
+    from kite_algo.groups import GroupStore
+    store = GroupStore()
+    g = store.start(name=args.name, expected_legs=args.legs)
+    _emit({
+        "group_id": g.id, "name": g.name,
+        "expected_legs": g.expected_legs,
+        "created_at_ms": g.created_at_ms,
+    }, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_group_status(args: argparse.Namespace) -> int:
+    """Show a group + all its legs + their live Kite order state.
+
+    For each leg we look up the order on Kite and report status +
+    filled_quantity. Helps agents reconcile which legs landed after a
+    crash or flaky network.
+    """
+    from kite_algo.groups import GroupStore
+    store = GroupStore()
+    g = store.get(args.group_id)
+    if g is None:
+        print(f"ERROR: group not found: {args.group_id}", file=sys.stderr)
+        return 1
+
+    members = store.members(args.group_id)
+
+    client = None
+    order_states: dict[str, dict] = {}
+    if members and not getattr(args, "skip_kite", False):
+        try:
+            client = _new_client()
+            # One orders() call, index by order_id — avoids N round-trips.
+            orders = client.orders() or []
+            order_states = {
+                str(o.get("order_id")): o for o in orders
+            }
+        except Exception as exc:
+            log.warning("group-status could not fetch live orders: %s",
+                        redact_text(str(exc)))
+
+    leg_rows = []
+    for m in members:
+        live = order_states.get(str(m.order_id), {})
+        leg_rows.append({
+            "order_id": m.order_id,
+            "leg_name": m.leg_name,
+            "tag": m.tag,
+            "status": live.get("status"),
+            "filled_quantity": live.get("filled_quantity"),
+            "pending_quantity": live.get("pending_quantity"),
+            "average_price": live.get("average_price"),
+        })
+
+    out = {
+        "group_id": g.id,
+        "name": g.name,
+        "expected_legs": g.expected_legs,
+        "actual_legs": len(members),
+        "closed": g.closed_at_ms is not None,
+        "legs": leg_rows,
+    }
+    _emit(out, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_group_cancel(args: argparse.Namespace) -> int:
+    """Cancel every still-open leg of a group. --yes required."""
+    _require_yes(args, "cancel all open legs in a group")
+    _require_not_halted("cancel all open legs in a group")
+
+    from kite_algo.groups import GroupStore
+    store = GroupStore()
+    g = store.get(args.group_id)
+    if g is None:
+        print(f"ERROR: group not found: {args.group_id}", file=sys.stderr)
+        return 1
+
+    members = store.members(args.group_id)
+    if not members:
+        _emit({"group_id": g.id, "cancelled": [], "failed": []},
+              args.format, cmd=args.cmd)
+        return 0
+
+    client = _new_client()
+    try:
+        live_orders = {str(o.get("order_id")): o for o in (client.orders() or [])}
+    except Exception as exc:
+        print(f"ERROR: could not fetch orderbook: {redact_text(str(exc))}",
+              file=sys.stderr)
+        return 1
+
+    cancelled: list[str] = []
+    failed: list[dict] = []
+    for m in members:
+        live = live_orders.get(str(m.order_id))
+        if not live or live.get("status") not in ("OPEN", "TRIGGER PENDING"):
+            continue
+        variety = live.get("variety") or "regular"
+        try:
+            client.cancel_order(variety=variety, order_id=m.order_id)
+            cancelled.append(m.order_id)
+        except Exception as exc:
+            failed.append({
+                "order_id": m.order_id,
+                "reason": redact_text(str(exc))[:200],
+            })
+
+    # Mark the group closed since we've attempted to flatten it.
+    store.close(g.id)
+
+    _emit({
+        "group_id": g.id,
+        "cancelled": cancelled,
+        "failed": failed,
+        "total_cancelled": len(cancelled),
+        "total_failed": len(failed),
+    }, args.format, cmd=args.cmd)
+    return 0 if not failed else 1
+
+
+# =============================================================================
+# EVENTS — tail local audit log
+# =============================================================================
+
+def cmd_events(args: argparse.Namespace) -> int:
+    """Read the SEBI-compliant audit log under data/audit/*.jsonl.
+
+    This is where agents reconstruct their own history after a crash,
+    verify that a given request_id actually ran, or diff their assumptions
+    against what really happened. No API call — purely local.
+
+    Filters:
+      --since YYYY-MM-DD    lower date bound (IST)
+      --until YYYY-MM-DD    upper date bound (IST)
+      --cmd NAME            only entries for this subcommand
+      --outcome ok|error    filter on exit code (0 vs non-zero)
+      --tail N              only the most recent N matching entries
+    """
+    from datetime import date
+    from kite_algo.audit import iter_entries, tail as audit_tail
+
+    def _parse_day(raw: str | None) -> date | None:
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError as exc:
+            raise SystemExit(f"--since/--until must be YYYY-MM-DD: {raw!r} ({exc})")
+
+    since = _parse_day(args.since)
+    until = _parse_day(args.until)
+
+    if args.tail is not None and args.tail > 0:
+        entries = audit_tail(
+            args.tail, cmd=args.cmd_filter, outcome=args.outcome,
+        )
+        # Even with --tail we still respect date bounds.
+        if since or until:
+            entries = [
+                e for e in entries
+                if (not since or date.fromisoformat(e["ts"][:10]) >= since)
+                and (not until or date.fromisoformat(e["ts"][:10]) <= until)
+            ]
+    else:
+        entries = list(iter_entries(
+            since=since, until=until,
+            cmd=args.cmd_filter, outcome=args.outcome,
+        ))
+
+    _emit(entries, args.format, cmd=args.cmd)
+    return 0
+
+
+# =============================================================================
+# WATCH — poll-until-condition
+# =============================================================================
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Poll a named resource every N seconds; exit 0 with the snapshot when
+    `--until EXPR` evaluates True; exit 124 if the deadline elapses first.
+
+    Agents use this to fold "poll with condition" into one atomic call
+    rather than spawning and coordinating a polling loop. Much cheaper than
+    WebSockets for turn-based agents.
+
+    Resource types:
+      quote NSE:RELIANCE → {last_price, volume, oi, ...}
+      ltp   NSE:RELIANCE → {last_price}
+      ohlc  NSE:RELIANCE → {last_price, open, high, low, close}
+      order ORD_ID       → latest order_history entry
+    """
+    from kite_algo.exit_codes import TIMEOUT
+    from kite_algo.watch_expr import UnsafeExpression, evaluate
+
+    resource = args.resource
+    interval = max(0.1, float(args.every))
+    timeout = float(args.timeout)
+    deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
+
+    client = _new_client()
+
+    def _fetch() -> dict:
+        if resource == "quote":
+            data = client.quote([args.symbol]) or {}
+            row = data.get(args.symbol, {}) or {}
+            # Flatten ohlc into the top level for convenient expressions.
+            ohlc = row.get("ohlc", {}) or {}
+            return {
+                "symbol": args.symbol,
+                "last_price": row.get("last_price"),
+                "volume": row.get("volume"),
+                "oi": row.get("oi"),
+                "open": ohlc.get("open"),
+                "high": ohlc.get("high"),
+                "low": ohlc.get("low"),
+                "close": ohlc.get("close"),
+                "avg_price": row.get("average_price"),
+                "net_change": row.get("net_change"),
+            }
+        if resource == "ltp":
+            data = client.ltp([args.symbol]) or {}
+            row = data.get(args.symbol, {}) or {}
+            return {"symbol": args.symbol, "last_price": row.get("last_price")}
+        if resource == "ohlc":
+            data = client.ohlc([args.symbol]) or {}
+            row = data.get(args.symbol, {}) or {}
+            ohlc = row.get("ohlc", {}) or {}
+            return {
+                "symbol": args.symbol,
+                "last_price": row.get("last_price"),
+                "open": ohlc.get("open"),
+                "high": ohlc.get("high"),
+                "low": ohlc.get("low"),
+                "close": ohlc.get("close"),
+            }
+        if resource == "order":
+            history = client.order_history(args.order_id) or []
+            if not history:
+                return {"order_id": args.order_id, "status": None}
+            # Parse-then-sort for correctness (W1.2).
+            history = sorted(
+                history, key=lambda h: _parse_order_timestamp(h.get("order_timestamp")),
+            )
+            last = history[-1]
+            return {
+                "order_id": args.order_id,
+                "status": last.get("status"),
+                "filled_quantity": last.get("filled_quantity"),
+                "average_price": last.get("average_price"),
+                "status_message": last.get("status_message"),
+            }
+        raise SystemExit(f"unknown watch resource: {resource!r}")
+
+    # Sanity-check the expression before we start the loop — invalid expr
+    # shouldn't waste API quota or tick-by-tick time.
+    try:
+        # Dry-eval with an empty snapshot. May return anything; we only
+        # care that the AST parses + nodes are allowed.
+        evaluate(args.until, {})
+    except UnsafeExpression as exc:
+        print(f"ERROR: unsafe --until expression: {exc}", file=sys.stderr)
+        return 2
+    except SyntaxError as exc:
+        print(f"ERROR: --until expression does not parse: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        # Tolerant — some expressions only succeed when a field is bound.
+        pass
+
+    last_snapshot: dict = {}
+    polls = 0
+    while time.monotonic() < deadline:
+        try:
+            last_snapshot = _fetch()
+        except Exception as exc:
+            # Transient error: log, sleep, retry — don't abort the watch.
+            log.warning("watch poll failed: %s", redact_text(str(exc)))
+        polls += 1
+        try:
+            if evaluate(args.until, last_snapshot):
+                out = {
+                    "matched": True,
+                    "polls": polls,
+                    "snapshot": last_snapshot,
+                    "expression": args.until,
+                }
+                _emit(out, args.format, cmd=args.cmd)
+                return 0
+        except Exception as exc:
+            log.debug("watch eval failed (likely missing field): %s", exc)
+        # Sleep until the next poll or the deadline, whichever comes first.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+
+    out = {
+        "matched": False,
+        "polls": polls,
+        "snapshot": last_snapshot,
+        "expression": args.until,
+        "reason": "timeout",
+    }
+    _emit(out, args.format, cmd=args.cmd)
+    return TIMEOUT
+
+
+# =============================================================================
+# STATUS — single-blob state introspection
+# =============================================================================
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Return one JSON blob summarising everything an agent needs to decide
+    what to do next: session validity, market hours per exchange, rate-limit
+    headroom, account state, live-window enforcement, halt state.
+
+    Designed for agent loops that start every cycle with "what is the state
+    of the world?" — one call, one blob, stable shape.
+
+    Does not fail if parts are unavailable (e.g. no live broker). Each
+    section is independent; a section with no data shows null or a
+    plausible default and moves on.
+    """
+    from datetime import datetime, timedelta
+    from kite_algo.market_rules import (
+        IST, is_market_open, market_close_time,
+        mis_cutoff_for, now_ist,
+        safe_login_time_today, in_token_rotation_window,
+    )
+
+    nowt = now_ist()
+
+    # ---- Session state --------------------------------------------------
+    cfg = KiteConfig.from_env()
+    session_block: dict[str, Any] = {
+        "valid": bool(cfg.access_token),
+        "user_id": cfg.user_id or None,
+        "in_rotation_window": in_token_rotation_window(nowt),
+    }
+    sess = load_session()
+    if sess.get("login_time"):
+        try:
+            lt = datetime.fromisoformat(sess["login_time"])
+            # Next rotation window starts 06:45 IST next day.
+            tomorrow = (lt + timedelta(days=1)).replace(
+                hour=6, minute=45, second=0, microsecond=0, tzinfo=IST,
+            )
+            session_block["expires_approx_ist"] = tomorrow.isoformat(timespec="seconds")
+            session_block["login_time"] = sess["login_time"]
+        except ValueError:
+            pass
+
+    # ---- Market hours per exchange -------------------------------------
+    market_block: dict[str, Any] = {
+        "ist_now": nowt.isoformat(timespec="seconds"),
+        "weekday": nowt.strftime("%A"),
+    }
+    for exch in ("NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"):
+        market_block[f"{exch.lower()}_open"] = is_market_open(exch, nowt)
+
+    # ---- Rate limiter headroom -----------------------------------------
+    lim = _RATE_LIMITER
+    # Non-destructive peek at remaining tokens / window capacity.
+    import time as _time
+    # Refill the general/historical/quote/orders_sec buckets without
+    # acquiring (no mutation). We can't read _tokens safely without the
+    # lock, but it's cheap to grab.
+    def _peek(bucket) -> float:
+        with bucket._cond:
+            # Refill math.
+            now = _time.monotonic()
+            elapsed = now - bucket._last
+            return min(bucket.capacity, bucket._tokens + elapsed * bucket.rate)
+    rate_block = {
+        "general_tokens_remaining": round(_peek(lim.general), 2),
+        "historical_tokens_remaining": round(_peek(lim.historical), 2),
+        "quote_tokens_remaining": round(_peek(lim.quote), 2),
+        "orders_sec_tokens_remaining": round(_peek(lim.orders_sec), 2),
+        "orders_per_min_used": len(lim.orders_min._events),
+        "orders_per_min_cap": lim.orders_min.max,
+        "orders_per_day_used": len(lim.orders_day._events),
+        "orders_per_day_cap": lim.orders_day.max,
+    }
+
+    # ---- Account snapshot ----------------------------------------------
+    account_block: dict[str, Any] = {
+        "available": None,
+        "open_orders": None,
+        "open_positions": None,
+        "holdings_count": None,
+        "day_m2m": None,
+    }
+    # Only try reading account state if we have a valid session AND the
+    # caller hasn't passed --skip-account.
+    if session_block["valid"] and not getattr(args, "skip_account", False):
+        try:
+            client = _new_client()
+            margins = client.margins(segment="equity") or {}
+            account_block["available"] = float(
+                (margins.get("available") or {}).get("live_balance")
+                or (margins.get("available") or {}).get("cash")
+                or 0
+            )
+            orders = client.orders() or []
+            account_block["open_orders"] = sum(
+                1 for o in orders
+                if o.get("status") in ("OPEN", "TRIGGER PENDING")
+            )
+            pos = client.positions() or {}
+            net_positions = pos.get("net", [])
+            account_block["open_positions"] = sum(
+                1 for p in net_positions if int(p.get("quantity") or 0) != 0
+            )
+            day_positions = pos.get("day", [])
+            account_block["day_m2m"] = round(
+                sum(float(p.get("m2m") or 0) for p in day_positions), 2,
+            )
+            account_block["holdings_count"] = len(client.holdings() or [])
+        except Exception as exc:
+            account_block["error"] = f"{type(exc).__name__}: {redact_text(str(exc))}"
+
+    # ---- Live-window + MIS cutoff --------------------------------------
+    live_block: dict[str, Any] = {
+        "nse_mis_cutoff_ist": mis_cutoff_for("NSE").isoformat(),
+        "mcx_mis_cutoff_ist": mis_cutoff_for("MCX").isoformat(),
+        "safe_login_after_ist": safe_login_time_today(nowt).isoformat(timespec="seconds"),
+    }
+
+    # ---- Halt --------------------------------------------------
+    from kite_algo.halt import read_halt
+    halt_state = read_halt()
+    halt_block = {
+        "is_halted": halt_state is not None,
+    }
+    if halt_state is not None:
+        halt_block.update(halt_state.to_dict())
+
+    out = {
+        "session": session_block,
+        "market": market_block,
+        "rate_limit": rate_block,
+        "account": account_block,
+        "live_window": live_block,
+        "halt": halt_block,
+    }
+    _emit(out, args.format, cmd=args.cmd)
+    return 0
+
+
+# =============================================================================
+# TIME — clocks, market open/close, expiries (pure-local, no API call)
+# =============================================================================
+
+def cmd_time(args: argparse.Namespace) -> int:
+    """Emit all the clocks an agent needs to plan actions:
+    IST now, UTC now, next token rotation window, per-exchange open/close
+    times, and next weekly expiry.  No API call.
+    """
+    from datetime import datetime, timezone
+    from kite_algo.market_rules import (
+        IST, in_token_rotation_window,
+        market_close_time, market_open_time,
+        mis_cutoff_for, next_weekly_expiry, now_ist,
+        safe_login_time_today,
+    )
+
+    nowt = now_ist()
+    ist_date = nowt.date()
+
+    out = {
+        "ist_now": nowt.isoformat(timespec="seconds"),
+        "utc_now": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+        "ist_date": ist_date.isoformat(),
+        "weekday": nowt.strftime("%A"),
+        "token_rotation": {
+            "window_ist": "06:45 - 07:30",
+            "in_window_now": in_token_rotation_window(nowt),
+            "next_safe_login": safe_login_time_today(nowt).isoformat(timespec="seconds"),
+        },
+        "market_hours_ist": {
+            "NSE": {
+                "open": market_open_time("NSE").isoformat(),
+                "close": market_close_time("NSE").isoformat(),
+            },
+            "BSE": {
+                "open": market_open_time("BSE").isoformat(),
+                "close": market_close_time("BSE").isoformat(),
+            },
+            "NFO": {
+                "open": market_open_time("NFO").isoformat(),
+                "close": market_close_time("NFO").isoformat(),
+            },
+            "MCX": {
+                "open": market_open_time("MCX").isoformat(),
+                "close": market_close_time("MCX").isoformat(),
+            },
+            "CDS": {
+                "open": market_open_time("CDS").isoformat(),
+                "close": market_close_time("CDS").isoformat(),
+            },
+        },
+        "mis_squareoff_ist": {
+            "equity": mis_cutoff_for("NSE").isoformat(),
+            "mcx": mis_cutoff_for("MCX").isoformat(),
+        },
+        "next_weekly_expiry": {
+            "nse": (next_weekly_expiry("NSE", ist_date) or "").__str__() or None,
+            "bse": (next_weekly_expiry("BSE", ist_date) or "").__str__() or None,
+        },
+    }
+    _emit(out, args.format, cmd=args.cmd)
+    return 0
+
+
+# =============================================================================
+# KILL SWITCH (halt / resume)
+# =============================================================================
+
+def cmd_halt(args: argparse.Namespace) -> int:
+    """Write the HALTED sentinel — every subsequent write command refuses
+    until the sentinel is removed. Safe to call while already halted (the
+    new reason / expires-in overwrite the existing sentinel).
+    """
+    expires_seconds = None
+    if args.expires_in:
+        try:
+            expires_seconds = parse_duration(args.expires_in)
+        except ValueError as exc:
+            print(f"ERROR: --expires-in: {exc}", file=sys.stderr)
+            return 2
+    state = write_halt(
+        reason=args.reason,
+        by=(args.by or os.getenv("KITE_OPERATOR", "operator")),
+        expires_in_seconds=expires_seconds,
+    )
+    out = state.to_dict()
+    out["halted"] = True
+    _emit(out, args.format, cmd=args.cmd)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Clear the HALTED sentinel. Requires `--confirm-resume` — distinct
+    from `--yes` so an agent that accidentally retries `halt --yes` won't
+    flip the state back on.
+    """
+    if not getattr(args, "confirm_resume", False):
+        print(
+            "ERROR: `resume` requires --confirm-resume. This is intentionally "
+            "a different token from --yes to prevent accidental lift of a halt.",
+            file=sys.stderr,
+        )
+        return 2
+    cleared = clear_halt()
+    _emit({"resumed": cleared}, args.format, cmd=args.cmd)
+    return 0
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
@@ -359,27 +1380,45 @@ def cmd_margins(args: argparse.Namespace) -> int:
         data = client.margins(segment=args.segment)
     else:
         data = client.margins()
-    _emit(data, args.format)
+    _emit(data, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_holdings(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.holdings(), args.format)
+    rows = client.holdings() or []
+    if args.summary:
+        _emit(summarize_holdings(rows), args.format, cmd=args.cmd)
+        return 0
+    rows = project_rows(rows, parse_fields(args.fields))
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_positions(args: argparse.Namespace) -> int:
     client = _new_client()
     data = client.positions() or {}
+    if args.summary:
+        _emit(summarize_positions(data), args.format, cmd=args.cmd)
+        return 0
     which = args.which or "net"
-    _emit(data.get(which, []), args.format)
+    rows = data.get(which, [])
+    rows = project_rows(rows, parse_fields(args.fields))
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_convert_position(args: argparse.Namespace) -> int:
     """Convert position product type (e.g. MIS → CNC, NRML → MIS)."""
     _require_yes(args, "convert a position")
+    if not getattr(args, "confirm_convert", False):
+        raise SystemExit(
+            "Refusing to convert-position without --confirm-convert. "
+            "This flag is distinct from --yes: unintended conversion can "
+            "reallocate margin or strand an intraday position overnight. "
+            "--confirm-convert forces explicit acknowledgment."
+        )
+    _require_not_halted("convert a position")
     client = _new_client()
     try:
         client.convert_position(
@@ -425,7 +1464,7 @@ def cmd_pnl(args: argparse.Namespace) -> int:
         "day_sell_value": round(total_day_sell, 2),
         "open_positions": sum(1 for p in net if int(p.get("quantity", 0) or 0) != 0),
     }
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -466,13 +1505,18 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
             "product": p.get("product"),
         })
 
-    _emit(rows, args.format)
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_orders(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.orders(), args.format)
+    rows = client.orders() or []
+    if args.summary:
+        _emit(summarize_orders(rows), args.format, cmd=args.cmd)
+        return 0
+    rows = project_rows(rows, parse_fields(args.fields))
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
@@ -481,25 +1525,31 @@ def cmd_open_orders(args: argparse.Namespace) -> int:
     client = _new_client()
     orders = client.orders() or []
     open_only = [o for o in orders if o.get("status") in ("OPEN", "TRIGGER PENDING")]
-    _emit(open_only, args.format)
+    if args.summary:
+        _emit(summarize_orders(open_only), args.format, cmd=args.cmd)
+        return 0
+    open_only = project_rows(open_only, parse_fields(args.fields))
+    _emit(open_only, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_trades(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.trades(), args.format)
+    rows = client.trades() or []
+    rows = project_rows(rows, parse_fields(args.fields))
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_order_history(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.order_history(args.order_id), args.format)
+    _emit(client.order_history(args.order_id), args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_order_trades(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.order_trades(args.order_id), args.format)
+    _emit(client.order_trades(args.order_id), args.format, cmd=args.cmd)
     return 0
 
 
@@ -511,22 +1561,71 @@ def _split_symbols(raw: str) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+# Kite's `/quote`, `/ohlc`, `/ltp` cap at 500 symbols per call. Above that
+# the API responds with a 400 InputException. Historically users had to
+# pre-chunk — we do it transparently.
+# Source: https://kite.trade/docs/connect/v3/market-quotes/
+QUOTE_BATCH_SIZE = 500
+
+
+def _batched_quote_call(
+    client: Any,
+    method_name: str,
+    symbols: list[str],
+    *,
+    batch_size: int = QUOTE_BATCH_SIZE,
+) -> dict:
+    """Call `client.{method_name}(symbols)` in ≤batch_size chunks and merge
+    the returned dicts.
+
+    Rate-limiting: the `quote` bucket (1 req/s) enforces pacing automatically
+    via `RateLimitedKiteClient` when the wrapped client is used. Batching
+    just keeps each call payload under Kite's 500-symbol ceiling.
+
+    Merging: Kite returns `{symbol: quote}`. When batches don't overlap (the
+    common case) merging is lossless. For overlapping batches later wins —
+    but we deduplicate the input first so overlap is impossible.
+    """
+    if not symbols:
+        return {}
+    # Deduplicate while preserving order so the agent's expected ordering is
+    # respected in table output.
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in symbols:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+
+    fn = getattr(client, method_name)
+    result: dict = {}
+    for i in range(0, len(uniq), batch_size):
+        chunk = uniq[i:i + batch_size]
+        resp = fn(chunk) or {}
+        if isinstance(resp, dict):
+            result.update(resp)
+        else:
+            # Some methods might theoretically return a list — fall through.
+            result[f"_batch_{i}"] = resp
+    return result
+
+
 def cmd_ltp(args: argparse.Namespace) -> int:
     client = _new_client()
     symbols = _split_symbols(args.symbols)
-    data = client.ltp(symbols)
+    data = _batched_quote_call(client, "ltp", symbols)
     rows = [
         {"symbol": k, "instrument_token": v.get("instrument_token"), "last_price": v.get("last_price")}
         for k, v in (data or {}).items()
     ]
-    _emit(rows, args.format)
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_ohlc(args: argparse.Namespace) -> int:
     client = _new_client()
     symbols = _split_symbols(args.symbols)
-    data = client.ohlc(symbols)
+    data = _batched_quote_call(client, "ohlc", symbols)
     rows = []
     for k, v in (data or {}).items():
         ohlc = v.get("ohlc", {}) or {}
@@ -539,14 +1638,14 @@ def cmd_ohlc(args: argparse.Namespace) -> int:
             "low": ohlc.get("low"),
             "close": ohlc.get("close"),
         })
-    _emit(rows, args.format)
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_quote(args: argparse.Namespace) -> int:
     client = _new_client()
     symbols = _split_symbols(args.symbols)
-    data = client.quote(symbols)
+    data = _batched_quote_call(client, "quote", symbols)
     if args.flat:
         rows = []
         for k, v in (data or {}).items():
@@ -566,9 +1665,9 @@ def cmd_quote(args: argparse.Namespace) -> int:
                 "oi": v.get("oi"),
                 "net_change": v.get("net_change"),
             })
-        _emit(rows, args.format)
+        _emit(rows, args.format, cmd=args.cmd)
     else:
-        _emit(data, args.format)
+        _emit(data, args.format, cmd=args.cmd)
     return 0
 
 
@@ -594,7 +1693,7 @@ def cmd_depth(args: argparse.Namespace) -> int:
                 "ask_qty": s.get("quantity"),
                 "ask_orders": s.get("orders"),
             })
-        _emit(rows, args.format)
+        _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
@@ -661,13 +1760,41 @@ def cmd_stream(args: argparse.Namespace) -> int:
             for marker in ("token", "401", "403", "invalidaccesstoken", "access token")
         )
 
+    # Stream buffering: if --buffer-to is given, every tick is also
+    # appended to that file as NDJSON. A separate `tail-ticks` command
+    # reads from the same file, letting an agent consume aggregated
+    # state rather than holding an open WebSocket.
+    #
+    # Each tick carries a monotonically increasing sequence number, so
+    # `tail-ticks --from SEQ` can resume without duplication.
+    buffer_file: Any = None
+    if getattr(args, "buffer_to", None):
+        buf_path = Path(args.buffer_to)
+        buf_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        buffer_file = open(buf_path, "a", encoding="utf-8", buffering=1)  # line-buffered
+
+    seq_counter = [0]
+
     def on_ticks(ws: Any, ticks: list[dict]) -> None:
         for tick in ticks:
+            seq_counter[0] += 1
+            payload = _to_jsonable(tick)
+            if isinstance(payload, dict):
+                payload.setdefault("_seq", seq_counter[0])
+                payload.setdefault("_ts_epoch_ms", int(time.time() * 1000))
+            line = json.dumps(payload, default=str)
             try:
-                print(json.dumps(_to_jsonable(tick), default=str), flush=True)
+                print(line, flush=True)
             except BrokenPipeError:
+                # stdout closed → shut down, but keep writing to the buffer
+                # file if one is attached so downstream consumers still get
+                # a full record.
                 _shutdown(0)
-                return
+            if buffer_file is not None:
+                try:
+                    buffer_file.write(line + "\n")
+                except Exception as exc:
+                    log.warning("buffer write failed: %s", redact_text(str(exc)))
 
     def on_connect(ws: Any, response: Any) -> None:
         log.info("ws connected — subscribing %d tokens mode=%s", len(tokens), subscribe_mode)
@@ -737,6 +1864,11 @@ def cmd_stream(args: argparse.Namespace) -> int:
             kws.close()
         except Exception:
             pass
+        if buffer_file is not None:
+            try:
+                buffer_file.close()
+            except Exception:
+                pass
 
     return exit_code
 
@@ -744,6 +1876,69 @@ def cmd_stream(args: argparse.Namespace) -> int:
 # =============================================================================
 # HISTORICAL / INSTRUMENTS
 # =============================================================================
+
+# Per-interval max lookback-per-request. Forum-sourced (not in docs), stable
+# since at least 2023. Exceeding these yields an InputException "date range is
+# too large". We auto-chunk rather than surface the error.
+# Source: Kite forum 8899 + confirmations on community issue trackers.
+HISTORICAL_MAX_LOOKBACK_DAYS = {
+    "minute": 60,
+    "3minute": 100,
+    "5minute": 100,
+    "10minute": 100,
+    "15minute": 200,
+    "30minute": 200,
+    "60minute": 400,
+    "day": 2000,
+}
+
+
+def _fetch_historical_chunked(
+    client: Any,
+    *,
+    token: int,
+    from_d: datetime,
+    to_d: datetime,
+    interval: str,
+    continuous: bool,
+    oi: bool,
+) -> list[dict]:
+    """Fetch `historical_data` in chunks that respect Kite's per-call lookback
+    cap, stitching the results together. No call spans more than the interval's
+    documented maximum.
+
+    If the interval is unknown, falls back to a single call (let Kite decide).
+    Rate limiting is enforced by `RateLimitedKiteClient`'s historical bucket —
+    each chunk waits ~3/s.
+    """
+    max_days = HISTORICAL_MAX_LOOKBACK_DAYS.get(interval)
+    if max_days is None:
+        return client.historical_data(
+            instrument_token=token,
+            from_date=from_d, to_date=to_d,
+            interval=interval, continuous=continuous, oi=oi,
+        ) or []
+
+    chunks: list[dict] = []
+    # Walk forward from `from_d` in max_days windows.
+    cursor = from_d
+    window = timedelta(days=max_days)
+    while cursor < to_d:
+        end = min(cursor + window, to_d)
+        # A single-day call uses inclusive intervals; no off-by-one adjustment
+        # needed — Kite returns bars with timestamp in [from_date, to_date].
+        bars = client.historical_data(
+            instrument_token=token,
+            from_date=cursor, to_date=end,
+            interval=interval, continuous=continuous, oi=oi,
+        ) or []
+        chunks.extend(bars)
+        if end >= to_d:
+            break
+        # Next window starts the next second to avoid duplicating boundary bar.
+        cursor = end + timedelta(seconds=1)
+    return chunks
+
 
 def cmd_history(args: argparse.Namespace) -> int:
     client = _new_client()
@@ -758,14 +1953,12 @@ def cmd_history(args: argparse.Namespace) -> int:
     to_d = datetime.fromisoformat(args.to) if args.to else datetime.now()
     from_d = datetime.fromisoformat(args.from_) if args.from_ else (to_d - timedelta(days=args.days))
 
-    bars = client.historical_data(
-        instrument_token=token,
-        from_date=from_d,
-        to_date=to_d,
+    bars = _fetch_historical_chunked(
+        client,
+        token=token, from_d=from_d, to_d=to_d,
         interval=args.interval,
-        continuous=args.continuous,
-        oi=args.oi,
-    ) or []
+        continuous=args.continuous, oi=args.oi,
+    )
     rows = [
         {
             "date": b["date"].isoformat() if hasattr(b["date"], "isoformat") else str(b["date"]),
@@ -778,7 +1971,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         }
         for b in bars
     ]
-    _emit(rows, args.format)
+    _emit(rows, args.format, cmd=args.cmd)
     return 0
 
 
@@ -805,7 +1998,15 @@ def _load_cached_instruments(exchange: str) -> list[dict] | None:
 
 
 def _save_cached_instruments(exchange: str, rows: list[dict]) -> Path:
-    INSTRUMENTS_CACHE.mkdir(parents=True, exist_ok=True)
+    """Persist the instruments dump atomically.
+
+    Kite's `/instruments` response is a multi-MB list. Writing it non-atomically
+    risks a corrupted cache if the process is killed mid-write, forcing an
+    expensive re-fetch on the next run (and racing parallel readers into
+    JSONDecodeError).
+    """
+    from kite_algo.config import atomic_write_text
+
     path = _instruments_cache_path(exchange)
     clean = []
     for r in rows:
@@ -814,7 +2015,8 @@ def _save_cached_instruments(exchange: str, rows: list[dict]) -> Path:
             if isinstance(v, (date, datetime)):
                 c[k] = v.isoformat()
         clean.append(c)
-    path.write_text(json.dumps({"fetched_at": time.time(), "rows": clean}), encoding="utf-8")
+    payload = json.dumps({"fetched_at": time.time(), "rows": clean})
+    atomic_write_text(path, payload, mode=0o644)
     return path
 
 
@@ -832,7 +2034,7 @@ def cmd_instruments(args: argparse.Namespace) -> int:
     client = _new_client()
     rows = _fetch_instruments(client, args.exchange, refresh=args.refresh)
     if args.dump:
-        _emit(rows, args.format)
+        _emit(rows, args.format, cmd=args.cmd)
         return 0
     by_segment: dict[str, int] = {}
     for r in rows:
@@ -843,7 +2045,7 @@ def cmd_instruments(args: argparse.Namespace) -> int:
         "by_segment": by_segment,
         "cache_path": str(_instruments_cache_path(args.exchange)),
     }
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -870,7 +2072,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             })
     if args.limit:
         out = out[: args.limit]
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -887,7 +2089,7 @@ def cmd_contract(args: argparse.Namespace) -> int:
     if not match:
         print(f"ERROR: instrument not found: {args.exchange}:{args.tradingsymbol}", file=sys.stderr)
         return 1
-    _emit(match, args.format)
+    _emit(match, args.format, cmd=args.cmd)
     return 0
 
 
@@ -907,7 +2109,7 @@ def cmd_expiries(args: argparse.Namespace) -> int:
     client = _new_client()
     rows = _fetch_instruments(client, "NFO")
     expiries = sorted({r.get("expiry") for r in rows if (r.get("name") or "").upper() == args.symbol.upper() and r.get("expiry")})
-    _emit([{"expiry": e} for e in expiries], args.format)
+    _emit([{"expiry": e} for e in expiries], args.format, cmd=args.cmd)
     return 0
 
 
@@ -962,10 +2164,9 @@ def cmd_chain(args: argparse.Namespace) -> int:
 
     if args.quote:
         symbols = [f"NFO:{r.get('tradingsymbol')}" for r in chain]
-        quote_data: dict[str, Any] = {}
-        BATCH = 500
-        for i in range(0, len(symbols), BATCH):
-            quote_data.update(client.quote(symbols[i:i + BATCH]) or {})
+        # Auto-batch at 500 (Kite /quote cap). Rate limiter pacing is
+        # enforced per-batch by the RateLimitedKiteClient proxy.
+        quote_data = _batched_quote_call(client, "quote", symbols)
 
         # Get underlying spot for greeks
         spot = None
@@ -1021,7 +2222,14 @@ def cmd_chain(args: argparse.Namespace) -> int:
             }
             for r in chain
         ]
-    _emit(out, args.format)
+    if args.summary:
+        # Use the just-fetched spot (if any) as the reference for ATM strike.
+        spot_ref = locals().get("spot") or None
+        summary = summarize_option_chain(out, spot=spot_ref)
+        _emit(summary, args.format, cmd=args.cmd)
+        return 0
+    out = project_rows(out, parse_fields(args.fields))
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1084,7 +2292,7 @@ def cmd_option_quote(args: argparse.Namespace) -> int:
         else:
             print(f"WARN: could not resolve underlying spot for {underlying_sym}", file=sys.stderr)
 
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1098,7 +2306,7 @@ def cmd_calc_iv(args: argparse.Namespace) -> int:
     if iv is None:
         print("ERROR: IV solver did not converge", file=sys.stderr)
         return 1
-    _emit({"iv_pct": round(iv * 100, 2), "iv_decimal": round(iv, 6)}, args.format)
+    _emit({"iv_pct": round(iv * 100, 2), "iv_decimal": round(iv, 6)}, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1112,7 +2320,7 @@ def cmd_calc_price(args: argparse.Namespace) -> int:
     g = compute_greeks(args.spot, args.strike, T, rfr, sigma, args.right)
     out = {k: round(v, 6) for k, v in g.items()}
     out["iv_pct"] = round(args.iv, 2)
-    _emit(out, args.format)
+    _emit(out, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1128,6 +2336,21 @@ def _require_yes(args: argparse.Namespace, action: str) -> None:
         )
 
 
+def _require_not_halted(action: str) -> None:
+    """Check the HALTED sentinel at the top of every write command.
+
+    Raises HaltActive which classifies as exit code 11. The message in the
+    error envelope explains how to resume.
+    """
+    state = read_halt()
+    if state is not None:
+        raise SystemExit(
+            f"Refusing to {action}: trading is HALTED "
+            f"(reason: {state.reason!r} by {state.by}). "
+            f"Run `kite-algo resume --confirm-resume` to clear."
+        )
+
+
 def cmd_place(args: argparse.Namespace) -> int:
     """Place a single order via Kite Connect.
 
@@ -1139,6 +2362,15 @@ def cmd_place(args: argparse.Namespace) -> int:
       5. --wait-for-fill: poll order_history until COMPLETE / REJECTED / CANCELLED.
     """
     _require_yes(args, "place an order")
+    _require_not_halted("place an order")
+
+    # Default market_protection for MARKET/SL-M when not explicitly set: -1 =
+    # Kite auto. Post-SEBI April 2026, omitting market_protection from MARKET
+    # orders is a server-side reject. pykiteconnect v5.1.0 doesn't auto-fill
+    # it either, so we set it here.
+    effective_market_protection = args.market_protection
+    if args.order_type in ("MARKET", "SL-M") and effective_market_protection is None:
+        effective_market_protection = -1
 
     # --- 1. Pre-flight validation -------------------------------------------
     errors = validate_order(
@@ -1157,10 +2389,41 @@ def cmd_place(args: argparse.Namespace) -> int:
         iceberg_legs=args.iceberg_legs,
         iceberg_quantity=args.iceberg_quantity,
         tag=args.tag,
+        market_protection=effective_market_protection,
     )
     if errors:
         print(format_errors(errors), file=sys.stderr)
         return 1
+
+    # --- 1b. Market-rule checks (hours, MIS cutoff, freeze qty, lot size) ---
+    # Any "error" severity violation blocks the order; "warn" is surfaced but
+    # allowed through. --skip-market-rules bypasses for testing / special
+    # cases (e.g. intentional AMO at night).
+    underlying = None
+    if args.exchange in ("NFO", "BFO"):
+        # Derivative tradingsymbols start with the underlying. Heuristic but
+        # good enough to cover NIFTY/BANKNIFTY/FINNIFTY/SENSEX etc.
+        for u in ("MIDCPNIFTY", "NIFTYNXT50", "BANKNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX"):
+            if args.tradingsymbol.upper().startswith(u):
+                underlying = u
+                break
+    if not getattr(args, "skip_market_rules", False):
+        violations = check_market_rules(
+            exchange=args.exchange,
+            product=args.product,
+            quantity=args.quantity,
+            tradingsymbol=args.tradingsymbol,
+            underlying=underlying,
+            allow_amo=(args.variety == "amo"),
+        )
+        errors_market = [v for v in violations if v.severity == "error"]
+        warnings_market = [v for v in violations if v.severity == "warn"]
+        for w in warnings_market:
+            print(f"WARN [{w.code}]: {w.message}", file=sys.stderr)
+        if errors_market:
+            for e in errors_market:
+                print(f"ERROR [{e.code}]: {e.message}", file=sys.stderr)
+            return 1
 
     client = _new_client()
 
@@ -1180,6 +2443,8 @@ def cmd_place(args: argparse.Namespace) -> int:
         extras["iceberg_legs"] = args.iceberg_legs
     if args.iceberg_quantity is not None:
         extras["iceberg_quantity"] = args.iceberg_quantity
+    if effective_market_protection is not None:
+        extras["market_protection"] = effective_market_protection
 
     # --- 3. --dry-run: preview margin + charges, no transmission ------------
     # Build a margin-calc payload with ONLY the fields order_margins accepts.
@@ -1200,6 +2465,10 @@ def cmd_place(args: argparse.Namespace) -> int:
             preview_order["price"] = args.price
         if args.order_type in ("SL", "SL-M") and args.trigger_price is not None:
             preview_order["trigger_price"] = args.trigger_price
+        if args.order_type in ("MARKET", "SL-M"):
+            # Mandatory for margin preview too, else Kite rejects with the
+            # same "market_protection required" input error.
+            preview_order["market_protection"] = effective_market_protection
 
         try:
             preview = client.order_margins([preview_order])
@@ -1210,11 +2479,56 @@ def cmd_place(args: argparse.Namespace) -> int:
             "=== DRY RUN — margin preview only. NO order transmitted. ===",
             file=sys.stderr,
         )
-        _emit(preview, args.format)
+        _emit(preview, args.format, cmd=args.cmd)
         return 0
 
     # --- 4. Idempotent placement -------------------------------------------
-    tag = args.tag or new_order_tag()
+    #
+    # Two layers of idempotency:
+    #   a) --idempotency-key KEY: durable, survives process restart.
+    #      Stored in data/idempotency.sqlite. On retry with the same key
+    #      we short-circuit if the prior attempt completed, or derive the
+    #      same tag to coax IdempotentOrderPlacer's orderbook lookup into
+    #      finding the in-flight order.
+    #   b) tag / IdempotentOrderPlacer: in-process retry with orderbook
+    #      polling on transient failure. Covers the single-invocation case.
+    #
+    # If --tag is given explicitly, it wins over the key-derived tag.
+
+    idem_store: IdempotencyStore | None = None
+    idem_key = getattr(args, "idempotency_key", None)
+    if idem_key:
+        idem_store = IdempotencyStore()
+        existing = idem_store.lookup(idem_key)
+        if existing is not None and existing.completed:
+            # Previous attempt already completed — replay the stored result.
+            replayed = existing.result or {}
+            if isinstance(replayed, dict):
+                replayed = {**replayed, "replayed": True,
+                            "first_seen_at_ms": existing.first_seen_at_ms}
+            _emit(replayed, args.format, cmd=args.cmd)
+            return existing.exit_code or 0
+
+    tag = args.tag
+    if tag is None:
+        tag = derive_tag_from_key(idem_key) if idem_key else new_order_tag()
+
+    request_snapshot = {
+        "exchange": args.exchange,
+        "tradingsymbol": args.tradingsymbol,
+        "transaction_type": args.transaction_type,
+        "order_type": args.order_type,
+        "quantity": args.quantity,
+        "product": args.product,
+        "variety": args.variety,
+        "tag": tag,
+        **extras,
+    }
+    if idem_store is not None and idem_key:
+        idem_store.record_attempt(
+            key=idem_key, cmd="place", request=request_snapshot, tag=tag,
+        )
+
     placer = IdempotentOrderPlacer(client, rate_limiter=_RATE_LIMITER)
     try:
         order_id = placer.place(
@@ -1229,6 +2543,8 @@ def cmd_place(args: argparse.Namespace) -> int:
             **extras,
         )
     except Exception as exc:
+        # On failure the idempotency row stays incomplete — a retry with the
+        # same key will try again (and benefit from orderbook-lookup dedup).
         print(f"ERROR: place_order failed: {exc}", file=sys.stderr)
         return 1
 
@@ -1252,8 +2568,70 @@ def cmd_place(args: argparse.Namespace) -> int:
         result["average_price"] = final_status.get("average_price")
         result["status_message"] = final_status.get("status_message")
 
-    _emit(result, args.format)
+    # Record completion in the idempotency cache before we emit, so a crash
+    # between emission and subsequent retries still reconciles correctly.
+    if idem_store is not None and idem_key:
+        idem_store.record_completion(
+            key=idem_key, result=result, exit_code=0,
+            kite_order_id=str(order_id),
+        )
+
+    # Attach this order to a group if the agent provided --group-id.
+    group_id = getattr(args, "group_id", None)
+    if group_id:
+        from kite_algo.groups import GroupStore
+        try:
+            GroupStore().add_member(
+                group_id=group_id,
+                order_id=str(order_id),
+                leg_name=getattr(args, "leg_name", None),
+                tag=tag,
+                idempotency_key=idem_key,
+            )
+            result["group_id"] = group_id
+            if getattr(args, "leg_name", None):
+                result["leg_name"] = args.leg_name
+        except Exception as exc:
+            log.warning("could not attach order to group %s: %s",
+                        group_id, redact_text(str(exc)))
+
+    _emit(result, args.format, cmd=args.cmd)
     return 0
+
+
+def _parse_order_timestamp(raw: Any) -> datetime:
+    """Parse a Kite order_timestamp to a `datetime` for correct sorting.
+
+    Kite returns timestamps in local IST, typically as either:
+      - `datetime` (pykiteconnect sometimes materialises these)
+      - `"YYYY-MM-DD HH:MM:SS"` (space-separated, no TZ; IST implied)
+      - ISO-8601 with offset (rare; e.g. `"2026-04-19T15:30:45+05:30"`)
+
+    We need the microsecond-safe comparison: string-sort of `"15:30:00"` vs
+    `"15:30:01"` happens to work, but e.g. `"2026-04-19 9:05:00"` vs
+    `"2026-04-19 10:05:00"` DOES NOT (leading zero missing on hour 9 can
+    reorder). Always parse before comparing.
+
+    Falls back to `datetime.min` on parse failure so malformed rows sort
+    FIRST (conservative — we pick the last valid row as the "latest state").
+    """
+    if isinstance(raw, datetime):
+        return raw
+    if not raw:
+        return datetime.min
+    s = str(raw).strip()
+    # Try ISO-8601 (with or without offset) — Python 3.11+ accepts space sep.
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    # Try Kite's usual "YYYY-MM-DD HH:MM:SS"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return datetime.min
 
 
 def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
@@ -1262,6 +2640,10 @@ def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
     Uses exponential backoff (100ms → 1s cap) so fast fills aren't polled
     slowly. Bails immediately on fatal errors (TokenException,
     PermissionException).
+
+    History rows are sorted by parsed `order_timestamp` (datetime), not by
+    raw string — otherwise same-second events with differing zero-padding
+    or timezone format can end up reordered.
     """
     terminal = {"COMPLETE", "REJECTED", "CANCELLED"}
     deadline = time.monotonic() + timeout
@@ -1271,9 +2653,7 @@ def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
         try:
             history = client.order_history(order_id) or []
             if history:
-                # Sort chronologically; Kite usually returns ordered but
-                # don't depend on it.
-                history = sorted(history, key=lambda h: h.get("order_timestamp") or "")
+                history = sorted(history, key=lambda h: _parse_order_timestamp(h.get("order_timestamp")))
                 last = history[-1]
                 if last.get("status") in terminal:
                     return last
@@ -1290,6 +2670,7 @@ def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel an order")
+    _require_not_halted("cancel an order")
     client = _new_client()
     client.cancel_order(variety=args.variety, order_id=args.order_id)
     print(f"cancel sent: variety={args.variety} order_id={args.order_id}", file=sys.stderr)
@@ -1298,6 +2679,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_modify(args: argparse.Namespace) -> int:
     _require_yes(args, "modify an order")
+    _require_not_halted("modify an order")
+    # Kite caps modifications at ~25 per order lifetime. Track locally so we
+    # fail fast rather than hit the server-side "Maximum allowed order
+    # modifications exceeded" InputException.
+    try:
+        count = record_modification(args.order_id)
+    except ModificationLimitExceeded as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     client = _new_client()
     kwargs: dict[str, Any] = {}
     if args.quantity is not None:
@@ -1310,8 +2701,14 @@ def cmd_modify(args: argparse.Namespace) -> int:
         kwargs["order_type"] = args.order_type
     if args.validity is not None:
         kwargs["validity"] = args.validity
+    if getattr(args, "market_protection", None) is not None:
+        kwargs["market_protection"] = args.market_protection
     client.modify_order(variety=args.variety, order_id=args.order_id, **kwargs)
-    print(f"modify sent: variety={args.variety} order_id={args.order_id}", file=sys.stderr)
+    print(
+        f"modify sent: variety={args.variety} order_id={args.order_id} "
+        f"(modification #{count} of {20})",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -1322,6 +2719,14 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
     success/failure. Exits non-zero if any cancel failed.
     """
     _require_yes(args, "cancel ALL open orders")
+    if not getattr(args, "confirm_panic", False):
+        raise SystemExit(
+            "Refusing to cancel ALL open orders without --confirm-panic. "
+            "This flag is distinct from --yes: a stray `cancel-all --yes` "
+            "retry would destroy the entire book. --confirm-panic forces "
+            "the agent to acknowledge the broader blast radius explicitly."
+        )
+    _require_not_halted("cancel ALL open orders")
     client = _new_client()
     orders = client.orders() or []
     cancelled: list[str] = []
@@ -1350,7 +2755,7 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
         "total_cancelled": len(cancelled),
         "total_failed": len(failed),
     }
-    _emit(result, args.format)
+    _emit(result, args.format, cmd=args.cmd)
     return 0 if not failed else 1
 
 
@@ -1360,18 +2765,19 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
 
 def cmd_gtt_list(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.get_gtts(), args.format)
+    _emit(client.get_gtts(), args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_gtt_get(args: argparse.Namespace) -> int:
     client = _new_client()
-    _emit(client.get_gtt(trigger_id=args.trigger_id), args.format)
+    _emit(client.get_gtt(trigger_id=args.trigger_id), args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_gtt_delete(args: argparse.Namespace) -> int:
     _require_yes(args, "delete a GTT")
+    _require_not_halted("delete a GTT")
     client = _new_client()
     client.delete_gtt(trigger_id=args.trigger_id)
     print(f"deleted gtt trigger_id={args.trigger_id}", file=sys.stderr)
@@ -1385,6 +2791,7 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
     Two-leg (OCO): two trigger values (stoploss, target) + two orders.
     """
     _require_yes(args, "create a GTT")
+    _require_not_halted("create a GTT")
     client = _new_client()
 
     trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
@@ -1437,13 +2844,14 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
         return 1
 
     print(f"GTT created: trigger_id={trigger_id}", file=sys.stderr)
-    _emit({"trigger_id": trigger_id}, args.format)
+    _emit({"trigger_id": trigger_id}, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_gtt_modify(args: argparse.Namespace) -> int:
     """Modify an existing GTT trigger."""
     _require_yes(args, "modify a GTT")
+    _require_not_halted("modify a GTT")
     client = _new_client()
 
     trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
@@ -1476,7 +2884,7 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
         return 1
 
     print(f"GTT modified: trigger_id={trigger_id}", file=sys.stderr)
-    _emit({"trigger_id": trigger_id}, args.format)
+    _emit({"trigger_id": trigger_id}, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1504,7 +2912,7 @@ def cmd_margin_calc(args: argparse.Namespace) -> int:
             "price": args.price or 0,
         }]
     data = client.order_margins(orders)
-    _emit(data, args.format)
+    _emit(data, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1516,7 +2924,7 @@ def cmd_basket_margin(args: argparse.Namespace) -> int:
         print(f"ERROR: --orders-json must be valid JSON: {exc}", file=sys.stderr)
         return 1
     data = client.basket_order_margins(orders)
-    _emit(data, args.format)
+    _emit(data, args.format, cmd=args.cmd)
     return 0
 
 
@@ -1534,7 +2942,7 @@ def _mf_subscription_hint() -> str:
 def cmd_mf_holdings(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_holdings(), args.format)
+        _emit(client.mf_holdings(), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_holdings failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -1545,7 +2953,7 @@ def cmd_mf_holdings(args: argparse.Namespace) -> int:
 def cmd_mf_orders(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_orders(), args.format)
+        _emit(client.mf_orders(), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_orders failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -1556,7 +2964,7 @@ def cmd_mf_orders(args: argparse.Namespace) -> int:
 def cmd_mf_sips(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_sips(), args.format)
+        _emit(client.mf_sips(), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_sips failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -1567,12 +2975,13 @@ def cmd_mf_sips(args: argparse.Namespace) -> int:
 def cmd_mf_instruments(args: argparse.Namespace) -> int:
     client = _new_client()
     data = client.mf_instruments()
-    _emit(data, args.format)
+    _emit(data, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_mf_place(args: argparse.Namespace) -> int:
     _require_yes(args, "place a mutual fund order")
+    _require_not_halted("place a mutual fund order")
     client = _new_client()
     try:
         order_id = client.place_mf_order(
@@ -1586,12 +2995,13 @@ def cmd_mf_place(args: argparse.Namespace) -> int:
         print(f"ERROR: place_mf_order failed: {exc}", file=sys.stderr)
         return 1
     print(f"MF order placed: order_id={order_id}", file=sys.stderr)
-    _emit({"order_id": order_id}, args.format)
+    _emit({"order_id": order_id}, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_mf_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel a mutual fund order")
+    _require_not_halted("cancel a mutual fund order")
     client = _new_client()
     try:
         client.cancel_mf_order(order_id=args.order_id)
@@ -1604,6 +3014,7 @@ def cmd_mf_cancel(args: argparse.Namespace) -> int:
 
 def cmd_mf_sip_create(args: argparse.Namespace) -> int:
     _require_yes(args, "create a mutual fund SIP")
+    _require_not_halted("create a mutual fund SIP")
     client = _new_client()
     try:
         sip_id = client.place_mf_sip(
@@ -1618,12 +3029,13 @@ def cmd_mf_sip_create(args: argparse.Namespace) -> int:
         print(f"ERROR: place_mf_sip failed: {exc}", file=sys.stderr)
         return 1
     print(f"SIP created: sip_id={sip_id}", file=sys.stderr)
-    _emit({"sip_id": sip_id}, args.format)
+    _emit({"sip_id": sip_id}, args.format, cmd=args.cmd)
     return 0
 
 
 def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
     _require_yes(args, "modify a mutual fund SIP")
+    _require_not_halted("modify a mutual fund SIP")
     client = _new_client()
     kwargs: dict[str, Any] = {"sip_id": args.sip_id}
     if args.amount is not None:
@@ -1645,6 +3057,7 @@ def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
 
 def cmd_mf_sip_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel a mutual fund SIP")
+    _require_not_halted("cancel a mutual fund SIP")
     client = _new_client()
     try:
         client.cancel_mf_sip(sip_id=args.sip_id)
@@ -1660,7 +3073,50 @@ def cmd_mf_sip_cancel(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--format", choices=["json", "csv", "table"], default="table")
+    """Flags that every subcommand inherits.
+
+    - `--format auto` (the default) resolves to `json` when stdout is not a
+      TTY (pipes, subprocesses, agent runs) and `table` when it is. JSON
+      output is wrapped in the canonical envelope; disable via
+      `KITE_NO_ENVELOPE=1` during migration.
+    - `--fields a,b,c` keeps only the named columns on list-returning
+      commands. Cuts agent context cost 60–90% on high-cardinality endpoints
+      like `chain` or `instruments --dump`.
+    - `--summary` emits a pre-aggregated rollup in place of the full list.
+      Understood by `orders`, `holdings`, `positions`, `chain`.
+    """
+    p.add_argument(
+        "--format",
+        choices=["auto", "json", "csv", "table"],
+        default="auto",
+        help="Output format (default: auto — json when piped, table when TTY). "
+             "JSON includes the stable envelope with request_id, warnings, "
+             "and meta. KITE_NO_ENVELOPE=1 disables envelope wrapping.",
+    )
+    p.add_argument(
+        "--fields",
+        default=None,
+        metavar="a,b,c",
+        help="Comma-separated list of fields to include on list-returning "
+             "commands. Missing fields are emitted as null (for CSV header "
+             "stability). Ignored by commands that emit single objects.",
+    )
+    p.add_argument(
+        "--summary",
+        action="store_true",
+        help="Emit a compact summary rollup instead of the full list. "
+             "Supported by: orders, holdings, positions, chain. Reduces "
+             "agent context cost 60-90%% on high-cardinality endpoints.",
+    )
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="Describe what this command would do, without making any API "
+             "call or side effect. Emits a structured description including "
+             "side effects, preconditions, reversibility, and idempotency. "
+             "Different from --dry-run: --explain is purely local; --dry-run "
+             "calls order_margins() to preview capital reservation.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1679,6 +3135,20 @@ def build_parser() -> argparse.ArgumentParser:
     def _add_yes(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--yes", action="store_true", help="Required live confirmation flag")
 
+    # --- meta (tools describe) ---
+    # Emits JSONSchema for every subcommand — ready to register directly as
+    # Claude/GPT tools. Introspects the live parser so this never drifts
+    # from the actual CLI shape.
+    def _cmd_tools_describe(args_: argparse.Namespace) -> int:
+        from kite_algo.tool_schema import describe_tools
+        # Defer: the parser is returned by build_parser(), which is us —
+        # pass p via closure.
+        _emit(describe_tools(p), args_.format, cmd=args_.cmd)
+        return 0
+
+    add("tools-describe", _cmd_tools_describe,
+        "Emit JSONSchema for every subcommand (for Claude/GPT tool use)")
+
     # --- auth ---
     s = add("login", cmd_login, "Interactive OAuth login (writes data/session.json)")
     s.add_argument("--no-browser", action="store_true")
@@ -1687,6 +3157,147 @@ def build_parser() -> argparse.ArgumentParser:
     add("session", cmd_session, "Current session status + approx expiry")
     add("health", cmd_health, "End-to-end health check (session, API, margins, market data)")
     add("logout", cmd_logout, "Invalidate access token + remove local session file")
+
+    # --- alerts (raw HTTP) ---
+    s = add("alerts-list", cmd_alerts_list,
+            "List alerts (pykiteconnect doesn't wrap /alerts — this uses raw HTTP)")
+    s.add_argument("--status", default=None, help="Filter by alert status")
+    s.add_argument("--page", type=int, default=1)
+    s.add_argument("--page-size", type=int, default=50)
+
+    s = add("alerts-get", cmd_alerts_get, "Get a single alert by uuid")
+    s.add_argument("--uuid", required=True)
+
+    s = add("alerts-create", cmd_alerts_create,
+            "Create a simple or ATO alert (ato = Alert-Triggers-Order)")
+    s.add_argument("--name", required=True)
+    s.add_argument("--type", required=True, choices=["simple", "ato"])
+    s.add_argument("--lhs-exchange", required=True,
+                   choices=["NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"])
+    s.add_argument("--lhs-tradingsymbol", required=True)
+    s.add_argument("--lhs-attribute", default="LastTradedPrice",
+                   help="Usually LastTradedPrice (default)")
+    s.add_argument("--operator", required=True, choices=["<", ">", "<=", ">=", "=="])
+    s.add_argument("--rhs-type", required=True, choices=["constant", "instrument"])
+    s.add_argument("--rhs-constant", type=float, default=None,
+                   help="Value threshold when --rhs-type=constant")
+    s.add_argument("--rhs-exchange", default=None)
+    s.add_argument("--rhs-tradingsymbol", default=None)
+    s.add_argument("--rhs-attribute", default=None)
+    s.add_argument("--basket-json", default=None,
+                   help="For --type=ato: JSON list of order specs to auto-place")
+    _add_yes(s)
+
+    s = add("alerts-modify", cmd_alerts_modify, "Modify an alert")
+    s.add_argument("--uuid", required=True)
+    s.add_argument("--name", default=None)
+    s.add_argument("--type", default=None, choices=["simple", "ato"])
+    s.add_argument("--lhs-exchange", default=None)
+    s.add_argument("--lhs-tradingsymbol", default=None)
+    s.add_argument("--lhs-attribute", default=None)
+    s.add_argument("--operator", default=None, choices=["<", ">", "<=", ">=", "=="])
+    s.add_argument("--rhs-type", default=None, choices=["constant", "instrument"])
+    s.add_argument("--rhs-constant", type=float, default=None)
+    s.add_argument("--rhs-exchange", default=None)
+    s.add_argument("--rhs-tradingsymbol", default=None)
+    s.add_argument("--rhs-attribute", default=None)
+    s.add_argument("--basket-json", default=None)
+    _add_yes(s)
+
+    s = add("alerts-delete", cmd_alerts_delete, "Delete an alert")
+    s.add_argument("--uuid", required=True)
+    _add_yes(s)
+
+    s = add("alerts-history", cmd_alerts_history, "Trigger history for an alert")
+    s.add_argument("--uuid", required=True)
+
+    # --- reconcile local vs kite ---
+    s = add("reconcile", cmd_reconcile,
+            "Diff local audit/idempotency records against Kite's live orderbook")
+    s.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                   help="Only consider local records since this date (IST)")
+    s.add_argument("--skip-kite", action="store_true",
+                   help="Skip live orderbook fetch; only report orphan groups + local state")
+
+    # --- multi-leg transaction groups ---
+    s = add("group-start", cmd_group_start,
+            "Begin a new multi-leg transaction; emits group_id for subsequent `place --group-id`")
+    s.add_argument("--name", required=True,
+                   help="Human-readable name of the group (e.g. BEAR_PUT_NIFTY)")
+    s.add_argument("--legs", type=int, default=None,
+                   help="Expected number of legs (optional; used by group-status to flag incomplete groups)")
+
+    s = add("group-status", cmd_group_status,
+            "Show a group + live Kite status of every leg")
+    s.add_argument("--group-id", required=True)
+    s.add_argument("--skip-kite", action="store_true",
+                   help="Skip the live /orders lookup; just show recorded legs")
+
+    s = add("group-cancel", cmd_group_cancel,
+            "Cancel every still-open leg of a group (requires --yes)")
+    s.add_argument("--group-id", required=True)
+    _add_yes(s)
+
+    # --- audit log tail ---
+    s = add("events", cmd_events,
+            "Tail the local SEBI-compliant audit log (data/audit/*.jsonl)")
+    s.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                   help="Lower date bound (inclusive, IST)")
+    s.add_argument("--until", default=None, metavar="YYYY-MM-DD",
+                   help="Upper date bound (inclusive, IST)")
+    s.add_argument("--cmd-filter", default=None, metavar="NAME",
+                   help="Only entries for this subcommand (e.g. `place`)")
+    s.add_argument("--outcome", default=None, choices=["ok", "error"],
+                   help="Filter on exit code: ok (0) or error (non-zero)")
+    s.add_argument("--tail", type=int, default=None, metavar="N",
+                   help="Only the last N matching entries")
+
+    # --- poll-until ---
+    s = add("watch", cmd_watch,
+            "Poll a resource until an expression is true or timeout")
+    s.add_argument("resource", choices=["quote", "ltp", "ohlc", "order"],
+                   help="What to poll")
+    s.add_argument("--symbol", default=None,
+                   help="For quote/ltp/ohlc: exchange-qualified symbol "
+                        "(e.g. NSE:RELIANCE)")
+    s.add_argument("--order-id", default=None,
+                   help="For resource=order: the order_id to poll")
+    s.add_argument("--every", type=float, default=2.0,
+                   help="Polling interval in seconds (default 2, min 0.1)")
+    s.add_argument("--until", required=True,
+                   metavar="EXPR",
+                   help="Exit 0 when this expression is truthy. Restricted "
+                        "AST: names, comparisons, and/or/not, arithmetic. "
+                        'E.g. "last_price > 1300 and volume > 100000"')
+    s.add_argument("--timeout", type=float, default=300.0,
+                   help="Max wall-clock seconds to wait (default 300; 0 = forever)")
+
+    # --- state introspection ---
+    s = add("status", cmd_status,
+            "Single-blob status: session, market, rate-limit, account, halt")
+    s.add_argument("--skip-account", action="store_true",
+                   help="Skip the account-state section (no live broker call). "
+                        "Useful when the Kite session is dead but you still "
+                        "want to see halt / market-hours state.")
+
+    add("time", cmd_time,
+        "Clocks, market open/close times, next weekly expiry, token rotation window")
+
+    # --- kill switch (halt / resume) ---
+    s = add("halt", cmd_halt,
+            "Set the HALTED sentinel — refuses all write commands until cleared")
+    s.add_argument("--reason", required=True,
+                   help="Short description of why trading is halted (stored in sentinel)")
+    s.add_argument("--by", default=None,
+                   help="Operator / agent identifier. Defaults to $KITE_OPERATOR or 'operator'.")
+    s.add_argument("--expires-in", default=None, metavar="DURATION",
+                   help="Auto-clear after duration (e.g. 30s, 5m, 1h, 2d). "
+                        "Without this flag the halt persists until `resume`.")
+
+    s = add("resume", cmd_resume,
+            "Clear the HALTED sentinel (requires --confirm-resume)")
+    s.add_argument("--confirm-resume", action="store_true",
+                   help="Required. Distinct from --yes to prevent accidental resume.")
 
     # --- account ---
     s = add("margins", cmd_margins, "Account margins")
@@ -1706,6 +3317,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--old-product", required=True, choices=["CNC", "MIS", "NRML", "MTF"])
     s.add_argument("--new-product", required=True, choices=["CNC", "MIS", "NRML", "MTF"])
     _add_yes(s)
+    s.add_argument("--confirm-convert", action="store_true",
+                   help="Required. Distinct from --yes — explicit acknowledgment "
+                        "that product conversion can reallocate margin / strand "
+                        "an intraday position overnight.")
 
     add("pnl", cmd_pnl, "Aggregate P&L from positions (day + net)")
     add("portfolio", cmd_portfolio, "Combined holdings + positions MTM view")
@@ -1742,6 +3357,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--order-updates", action="store_true", help="Also stream order update events")
     s.add_argument("--reconnect-max-tries", type=int, default=50, help="Max reconnection attempts")
     s.add_argument("--reconnect-max-delay", type=int, default=60, help="Max backoff between reconnects (s)")
+    s.add_argument("--buffer-to", default=None, metavar="PATH",
+                   help="Also append every emitted tick to PATH as NDJSON. "
+                        "Lets a separate `tail-ticks` reader consume the stream "
+                        "without holding a WebSocket.")
+
+    s = add("tail-ticks", cmd_tail_ticks,
+            "Read NDJSON ticks from a file populated by `stream --buffer-to`")
+    s.add_argument("path", help="NDJSON buffer file path")
+    s.add_argument("--symbols", default=None,
+                   help="Comma list of tradingsymbols OR instrument_tokens to keep")
+    s.add_argument("--from-seq", type=int, default=None,
+                   help="Resume: skip ticks with _seq < N")
+    s.add_argument("--limit", type=int, default=None,
+                   help="Stop after emitting N ticks")
+    s.add_argument("--follow", action="store_true",
+                   help="Keep reading as new lines arrive (like `tail -f`)")
+    s.add_argument("--poll-interval", type=float, default=0.25,
+                   help="Sleep between read attempts when --follow is set")
 
     # --- historical ---
     s = add("history", cmd_history, "Historical OHLC bars")
@@ -1822,6 +3455,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--iceberg-legs", type=int, default=None)
     s.add_argument("--iceberg-quantity", type=int, default=None)
     s.add_argument("--tag", default=None, help="Order tag (auto-generated if omitted; used for idempotency)")
+    s.add_argument(
+        "--idempotency-key",
+        default=None,
+        metavar="KEY",
+        help="Durable idempotency key. On retry with the same key the "
+             "prior attempt's result is replayed from the local SQLite cache. "
+             "Also used to deterministically derive the Kite tag, so "
+             "orderbook-based dedup still works across process restarts.",
+    )
+    s.add_argument("--group-id", default=None,
+                   help="Attach this order to a multi-leg group (see `group-start`). "
+                        "Lets `group-status` and `group-cancel` operate over related legs.")
+    s.add_argument("--leg-name", default=None,
+                   help="Human-readable leg label within the group, e.g. 'short_put'.")
+    s.add_argument("--market-protection", type=float, default=None,
+                   help="MARKET/SL-M slippage guard (SEBI-mandatory as of Apr 2026). "
+                        "Defaults to -1 (Kite auto). Positive values = percent; e.g. 1.0 = +/-1%% of LTP.")
+    s.add_argument("--skip-market-rules", action="store_true",
+                   help="Bypass local hour/MIS-cutoff/freeze-qty/lot-size checks. "
+                        "Kite's OMS will still enforce server-side — this just "
+                        "skips the pre-flight. Use with care.")
     s.add_argument("--dry-run", action="store_true", help="Preview margin/charges via order_margins(); DO NOT place")
     s.add_argument("--wait-for-fill", type=float, default=0, help="Poll for N seconds until COMPLETE/REJECTED/CANCELLED (0=return immediately)")
     _add_yes(s)
@@ -1839,10 +3493,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trigger-price", type=float, default=None)
     s.add_argument("--order-type", default=None, choices=["MARKET", "LIMIT", "SL", "SL-M"])
     s.add_argument("--validity", default=None, choices=["DAY", "IOC", "TTL"])
+    s.add_argument("--market-protection", type=float, default=None,
+                   help="Update market_protection; only meaningful when modifying a MARKET/SL-M order.")
     _add_yes(s)
 
     s = add("cancel-all", cmd_cancel_all, "Cancel every open order")
     _add_yes(s)
+    s.add_argument("--confirm-panic", action="store_true",
+                   help="Required. Distinct from --yes — explicit acknowledgment "
+                        "that this will cancel the ENTIRE open book.")
 
     # --- GTT ---
     add("gtt-list", cmd_gtt_list, "List active GTTs")
@@ -1935,17 +3594,67 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from kite_algo.audit import log_command
+    from kite_algo.envelope import new_request_id, parent_request_id
+    from kite_algo.exit_codes import classify_exception
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    # --explain is a meta-flag: skip the real command, emit a structured
+    # description. This is purely local — no API call, no session, no risk.
+    if getattr(args, "explain", False):
+        from kite_algo.explain import explain
+        _emit(explain(args.cmd), args.format, cmd=args.cmd)
+        return 0
+
+    # SEBI-compliant audit: log every invocation exactly once, with outcome.
+    request_id = new_request_id()
+    started_ms = int(time.time() * 1000)
+    args_for_log = {
+        k: v for k, v in vars(args).items()
+        if k not in ("func",) and not callable(v)
+    }
+    rc: int = 0
+    err_code: str | None = None
     try:
-        return args.func(args)
+        rc = args.func(args)
     except KeyboardInterrupt:
-        return 130
-    except SystemExit:
-        raise
+        rc = 130
+        err_code = "SIGINT"
+    except SystemExit as exc:
+        # Preserve explicit exit code; argparse returns 2 for usage errors.
+        if isinstance(exc.code, int):
+            rc = exc.code
+        elif isinstance(exc.code, str):
+            # Our _require_yes / _require_not_halted use SystemExit(str).
+            print(exc.code, file=sys.stderr)
+            rc = 2
+            err_code = "USAGE"
+        else:
+            rc = 0
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        cls = classify_exception(exc)
+        rc = cls.exit_code
+        err_code = cls.error_code
+        print(f"ERROR: {_redact_secrets(str(exc))}", file=sys.stderr)
+    finally:
+        try:
+            elapsed = int(time.time() * 1000) - started_ms
+            log_command(
+                cmd=args.cmd,
+                request_id=request_id,
+                args=args_for_log,
+                exit_code=rc,
+                error_code=err_code,
+                elapsed_ms=elapsed,
+                parent_request_id=parent_request_id(),
+                strategy_id=os.getenv("KITE_STRATEGY_ID"),
+                agent_id=os.getenv("KITE_AGENT_ID"),
+            )
+        except Exception:
+            # Never let an audit-log failure crash the process.
+            pass
+    return rc
 
 
 if __name__ == "__main__":
