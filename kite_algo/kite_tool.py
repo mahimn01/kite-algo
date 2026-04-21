@@ -622,13 +622,32 @@ def cmd_health(args: argparse.Namespace) -> int:
         _emit(checks, args.format, cmd=args.cmd)
         return 1
 
-    # 4. Margins endpoint
+    # 4. Margins endpoint — tolerate the Kite server-side 500 ('Message
+    # build error') that hits NRO / F&O-restricted accounts. Confirm
+    # the derived-view fallback path is live so `margins` still returns
+    # usable data. Health is DEGRADED, not FAILED, in that case.
     try:
         margins = client.margins(segment="equity")
         avail = margins.get("net", 0)
         record("margins", True, f"equity net ₹{avail:,.0f}")
     except Exception as exc:
-        record("margins", False, f"{type(exc).__name__}: {exc}")
+        if _is_kite_margins_build_error(exc):
+            try:
+                derived = _derive_margins_from_portfolio(client)
+                hv = derived["equity"]["holdings_value_inr"]
+                record(
+                    "margins", True,
+                    f"DEGRADED: /user/margins returns 500; fallback "
+                    f"(holdings ₹{hv:,.0f}) active",
+                )
+            except Exception as fb_exc:
+                record(
+                    "margins", False,
+                    f"/user/margins 500 AND fallback failed: "
+                    f"{type(fb_exc).__name__}: {fb_exc}",
+                )
+        else:
+            record("margins", False, f"{type(exc).__name__}: {exc}")
 
     # 5. Market data endpoint (LTP)
     try:
@@ -1598,13 +1617,161 @@ def cmd_logout(args: argparse.Namespace) -> int:
 # ACCOUNT
 # =============================================================================
 
+def _is_kite_margins_build_error(exc: Exception) -> bool:
+    """True iff `exc` is the Kite server-side HTTP 500 'Message build error'
+    that /user/margins sporadically returns for certain accounts (NRO and
+    some F&O-disabled subtypes especially).
+
+    Matched on both the `code` attribute (kiteconnect.exceptions sets it to
+    the HTTP status) and the human-readable message. Either alone is weak —
+    combined is robust across kiteconnect SDK versions.
+    """
+    if type(exc).__name__ != "GeneralException":
+        return False
+    msg = str(exc).lower()
+    if "message build error" not in msg:
+        return False
+    code = getattr(exc, "code", None)
+    # Some SDK versions set code=500, others leave it None when the body
+    # includes an error_type. Accept both.
+    return code in (None, 500)
+
+
+def _derive_margins_from_portfolio(client: Any) -> dict:
+    """Compute a best-effort margins view from `/portfolio/holdings` +
+    `/portfolio/positions` (both known-working on accounts where
+    `/user/margins` returns 500).
+
+    Returns only what the portfolio endpoints expose — specifically NOT
+    free cash or buying power, which live exclusively behind /user/margins.
+    The caller must wrap this with a clear `MARGINS_UNAVAILABLE` warning
+    so an agent doesn't mistake the derived view for a funds-available
+    check.
+    """
+    holdings = client.holdings() or []
+    positions_raw = client.positions() or {}
+    net_positions = positions_raw.get("net", []) or []
+    day_positions = positions_raw.get("day", []) or []
+
+    def _f(v: Any) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    holdings_value = sum(_f(h.get("last_price")) * _f(h.get("quantity")) for h in holdings)
+    holdings_invested = sum(_f(h.get("average_price")) * _f(h.get("quantity")) for h in holdings)
+    holdings_pnl = holdings_value - holdings_invested
+    holdings_day_pnl = sum(_f(h.get("day_change")) * _f(h.get("quantity")) for h in holdings)
+
+    positions_exposure = sum(abs(_f(p.get("value"))) for p in net_positions)
+    positions_unrealised = sum(_f(p.get("unrealised")) for p in net_positions)
+    positions_realised = sum(_f(p.get("realised")) for p in net_positions)
+    day_m2m = sum(_f(p.get("m2m")) for p in day_positions)
+
+    return {
+        "derived_from": "holdings + positions (Kite /user/margins returned 500)",
+        "equity": {
+            "holdings_value_inr": round(holdings_value, 2),
+            "holdings_invested_inr": round(holdings_invested, 2),
+            "holdings_unrealised_pnl_inr": round(holdings_pnl, 2),
+            "holdings_day_pnl_inr": round(holdings_day_pnl, 2),
+            "holdings_count": len(holdings),
+        },
+        "fno": {
+            "open_positions_count": sum(
+                1 for p in net_positions if _f(p.get("quantity")) != 0
+            ),
+            "exposure_inr": round(positions_exposure, 2),
+            "unrealised_pnl_inr": round(positions_unrealised, 2),
+            "realised_pnl_inr": round(positions_realised, 2),
+            "day_m2m_inr": round(day_m2m, 2),
+        },
+        # These require /user/margins to resolve — we can't derive them.
+        "available_cash_inr": None,
+        "used_margin_inr": None,
+        "net_liquidation_inr": None,
+        "notes": [
+            "Free cash and net liquidation are not derivable via portfolio "
+            "endpoints. Check the dashboard at kite.zerodha.com, or retry "
+            "`margins` later — the Kite 500 is typically transient.",
+            "NRO / F&O-restricted accounts hit this more often; Zerodha "
+            "support can usually fix it by reopening the segment.",
+        ],
+    }
+
+
 def cmd_margins(args: argparse.Namespace) -> int:
+    """Fetch account margins. On the sporadic Kite server-side 500
+    ('Message build error'), retry with a small backoff, then fall back
+    to a derived view computed from holdings + positions (with a clear
+    `MARGINS_UNAVAILABLE` warning on the envelope).
+
+    Use `--no-fallback` to get a hard error when the primary endpoint
+    fails — useful for cron jobs that treat partial data as ambiguous.
+    """
     client = _new_client()
-    if args.segment:
-        data = client.margins(segment=args.segment)
-    else:
-        data = client.margins()
-    _emit(data, args.format, cmd=args.cmd)
+    max_retries = int(getattr(args, "retries", 2) or 0)
+    backoff = 0.5
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            if args.segment:
+                data = client.margins(segment=args.segment)
+            else:
+                data = client.margins()
+            _emit(data, args.format, cmd=args.cmd)
+            return 0
+        except Exception as exc:
+            last_exc = exc
+            if not _is_kite_margins_build_error(exc):
+                raise  # real error — don't mask
+            # Kite server-side 500 — retry if we have attempts left.
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            break
+
+    # Exhausted retries on the Kite "Message build error" 500.
+    if getattr(args, "no_fallback", False):
+        msg = (
+            f"ERROR: Kite /user/margins returned a server-side 500 "
+            f"({last_exc}). Retry later or check kite.zerodha.com.\n"
+            f"(Run without --no-fallback to get a derived view from "
+            f"holdings + positions instead.)"
+        )
+        print(msg, file=sys.stderr)
+        return 1
+
+    # Graceful fallback — compute what we can from portfolio endpoints.
+    try:
+        derived = _derive_margins_from_portfolio(client)
+    except Exception as exc:
+        print(
+            f"ERROR: /user/margins unavailable ({last_exc}); fallback to "
+            f"holdings+positions also failed: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    warnings = [{
+        "code": "MARGINS_UNAVAILABLE",
+        "message": (
+            f"Kite /user/margins returned HTTP 500 'Message build error'. "
+            f"Returning a derived view from holdings + positions. Free "
+            f"cash is not available via the API for this account."
+        ),
+        "underlying_error": str(last_exc) if last_exc else None,
+        "suggested_action": (
+            "Retry `margins` later (the Kite 500 is typically transient), "
+            "check kite.zerodha.com for live cash balance, or contact "
+            "Zerodha support if it persists (NRO/F&O segment reopen "
+            "usually fixes it)."
+        ),
+    }]
+    _emit(derived, args.format, cmd=args.cmd, warnings=warnings)
     return 0
 
 
@@ -3550,8 +3717,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Required. Distinct from --yes to prevent accidental resume.")
 
     # --- account ---
-    s = add("margins", cmd_margins, "Account margins")
+    s = add("margins", cmd_margins,
+            "Account margins. Transparently retries on Kite server-side 500 "
+            "and falls back to a derived view (holdings + positions) when "
+            "/user/margins is unavailable.")
     s.add_argument("--segment", choices=["equity", "commodity"], default=None)
+    s.add_argument("--retries", type=int, default=2, metavar="N",
+                   help="Retry count for transient Kite 5xx (default 2; 0 disables).")
+    s.add_argument("--no-fallback", action="store_true", dest="no_fallback",
+                   help="Error hard when /user/margins 500s instead of "
+                        "returning a derived view. Use in cron/monitoring "
+                        "jobs that must distinguish 'primary source down'.")
 
     s = add("holdings", cmd_holdings, "Demat holdings")
 
