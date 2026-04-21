@@ -315,24 +315,85 @@ def _exchange_and_save(
     return 0
 
 
+def _extract_request_token(raw: str) -> str:
+    """Accept either a bare `request_token` value or a full callback URL
+    and return just the token.
+
+    Enables the remote-login scenario: user completes 2FA on their phone,
+    the phone's browser shows a broken "can't connect" page, but the URL
+    bar has the full callback URL. They copy the URL, SSH into the Mac,
+    paste it — we extract the token.
+
+    Recognised shapes:
+      - bare token (no `=` or `?` in input) → returned as-is
+      - `request_token=TOKEN` (exactly the key-value) → token
+      - `http://127.0.0.1/?...&request_token=TOKEN&...` → token via urlparse
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if "request_token" not in raw and "?" not in raw and "=" not in raw:
+        return raw  # bare token
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = parsed.query or raw.split("?", 1)[-1]
+        params = urllib.parse.parse_qs(query)
+        tok = params.get("request_token")
+        if tok:
+            return tok[0]
+    except Exception:
+        pass
+    # Last-ditch scan — handles "request_token=XYZ" fragments.
+    for part in raw.replace("&", " ").split():
+        if part.startswith("request_token="):
+            return part.split("=", 1)[1]
+    return raw  # give the exchange a chance; it'll produce a clear error
+
+
+def _paste_flow(client, cfg, args) -> int:
+    """Prompt for a token / full URL and complete the exchange. Shared
+    between --paste mode and the listener's on-timeout fallback.
+    """
+    print(
+        "\nAfter signing in, copy EITHER the full callback URL from your\n"
+        "browser's address bar (even if the page failed to load) OR just\n"
+        "the request_token value. Either works.\n",
+        file=sys.stderr,
+    )
+    try:
+        raw = getpass.getpass("request_token (or full URL): ").strip()
+    except EOFError:
+        raw = ""
+
+    token = _extract_request_token(raw)
+    if not token:
+        print("ERROR: empty request_token", file=sys.stderr)
+        return 1
+    return _exchange_and_save(client, cfg, token, args)
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     """Interactive OAuth login.
 
-    Two modes:
+    Three modes:
 
     - **Listener (default)**: bind `http://127.0.0.1:<port>/` on this
       machine, open the Kite login URL, wait for Kite's 302 to hit our
-      listener, verify CSRF state, and exchange the captured
-      `request_token` for an access_token. Matches the `gh auth login`
-      / `stripe login` / `gcloud auth login` pattern. Requires the Kite
-      app profile at developers.kite.trade to register
-      `http://127.0.0.1:<port>/` as its redirect URI (Zerodha explicitly
-      allows this — HTTPS is waived for loopback).
+      listener, verify CSRF state, exchange the captured `request_token`.
+      Matches `gh auth login` / `stripe login` / `gcloud auth login`.
+      Kite app profile at developers.kite.trade must register
+      `http://127.0.0.1:<port>/` as its redirect URI.
 
-    - **Paste (`--paste`)**: fall back to the original copy/paste flow
-      for when the listener can't be reached (agent sandbox, exotic
-      network, user signing in on a different device without SSH port
-      forwarding).
+    - **Listener with auto-fallback (default behaviour)**: if the listener
+      times out (common remote-login case: browser is on a phone, callback
+      hits the phone's localhost not the Mac's), prompt to paste the
+      callback URL instead of aborting.
+
+    - **Paste (`--paste`)**: skip the listener entirely. User pastes the
+      full callback URL OR the bare request_token — both work.
+
+    Use `--kite-redirect-uri URL` to derive the listener port from your
+    already-registered Kite redirect URI (avoids port-mismatch errors).
     """
     KiteConnect = _import_kiteconnect()
     cfg = KiteConfig.from_env()
@@ -341,6 +402,26 @@ def cmd_login(args: argparse.Namespace) -> int:
     client = KiteConnect(api_key=cfg.api_key)
     base_login_url = client.login_url()
 
+    # Resolve listener port: --kite-redirect-uri overrides --listen-port.
+    listen_port = int(args.listen_port)
+    registered_uri_hint: str | None = None
+    if getattr(args, "kite_redirect_uri", None):
+        try:
+            parsed = urllib.parse.urlparse(args.kite_redirect_uri)
+            if parsed.port:
+                listen_port = int(parsed.port)
+            elif parsed.scheme == "http":
+                listen_port = 80  # implicit in http://
+            elif parsed.scheme == "https":
+                listen_port = 443  # implicit in https://
+            registered_uri_hint = args.kite_redirect_uri
+        except Exception as exc:
+            print(
+                f"ERROR: could not parse --kite-redirect-uri {args.kite_redirect_uri!r}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
     if args.paste:
         print(f"Opening Kite login URL:\n  {base_login_url}", file=sys.stderr)
         if not args.no_browser:
@@ -348,26 +429,12 @@ def cmd_login(args: argparse.Namespace) -> int:
                 webbrowser.open(base_login_url)
             except Exception:
                 pass
-
-        # getpass so the token never echoes or lands in shell history.
-        print(
-            "\nAfter signing in, copy `request_token=...` from the redirect URL\n"
-            "and paste it below (input will not echo).",
-            file=sys.stderr,
-        )
-        try:
-            request_token = getpass.getpass("request_token: ").strip()
-        except EOFError:
-            request_token = ""
-
-        if not request_token:
-            print("ERROR: empty request_token", file=sys.stderr)
-            return 1
-        return _exchange_and_save(client, cfg, request_token, args)
+        return _paste_flow(client, cfg, args)
 
     # Default: local loopback listener.
     from kite_algo.oauth_callback import (
         CallbackServer,
+        LocalBindOnlyError,
         login_url_with_state,
         new_state_nonce,
     )
@@ -376,23 +443,54 @@ def cmd_login(args: argparse.Namespace) -> int:
     login_url = login_url_with_state(base_login_url, state)
 
     try:
-        server = CallbackServer(port=args.listen_port, expected_state=state)
+        server = CallbackServer(port=listen_port, expected_state=state)
         server.start()
+    except PermissionError as exc:
+        # Privileged-port bind (port < 1024) without sudo.
+        hint = ""
+        if sys.platform == "darwin":
+            hint = (
+                f"\nPort {listen_port} is privileged on macOS. Options:\n"
+                f"  1. Run with sudo:  sudo python -m kite_algo.kite_tool login\n"
+                f"  2. Redirect 80→5000 via pfctl (one-time setup):\n"
+                f"       echo 'rdr pass on lo0 inet proto tcp from any to any port 80 -> 127.0.0.1 port 5000' \\\n"
+                f"         | sudo pfctl -ef -\n"
+                f"     Then re-run with --listen-port 5000 (or change Kite redirect to :5000).\n"
+                f"  3. Use --paste mode."
+            )
+        else:
+            hint = (
+                f"\nPort {listen_port} is privileged on this OS. Run with\n"
+                f"sudo or use setcap 'cap_net_bind_service=+ep'."
+            )
+        print(f"ERROR: bind port {listen_port} denied: {exc}{hint}", file=sys.stderr)
+        return 1
     except OSError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     try:
         redirect_uri = server.redirect_uri
-        print(
+        banner = (
             "Kite login — listener mode.\n"
-            f"  Redirect URI to register at developers.kite.trade: {redirect_uri}\n"
             f"  Listening on:                                     {redirect_uri}\n"
-            f"  Timeout:                                          {args.timeout:.0f}s\n"
-            f"\nOpen this URL in ANY browser (your phone works over an SSH tunnel\n"
-            f"— see docs/LOGIN.md for the recipe):\n\n  {login_url}\n",
-            file=sys.stderr,
         )
+        if registered_uri_hint:
+            banner += f"  Kite app must register:                          {registered_uri_hint}\n"
+            if registered_uri_hint.rstrip("/") != redirect_uri.rstrip("/"):
+                banner += (
+                    f"  WARNING: listener URL {redirect_uri} does NOT match the\n"
+                    f"  registered redirect URI {registered_uri_hint}. Kite matches\n"
+                    f"  exactly — the callback will miss the listener.\n"
+                )
+        else:
+            banner += f"  Redirect URI to register at developers.kite.trade: {redirect_uri}\n"
+        banner += (
+            f"  Timeout:                                          {args.timeout:.0f}s\n"
+            f"\nOpen this URL in ANY browser (phone works over SSH tunnel\n"
+            f"— see docs/LOGIN.md):\n\n  {login_url}\n"
+        )
+        print(banner, file=sys.stderr)
         if not args.no_browser:
             try:
                 webbrowser.open(login_url)
@@ -400,43 +498,56 @@ def cmd_login(args: argparse.Namespace) -> int:
                 pass
 
         print(
-            f"Waiting for callback (up to {args.timeout:.0f}s)...",
+            f"Waiting for callback (up to {args.timeout:.0f}s)... "
+            f"Ctrl+C to abort.",
             file=sys.stderr,
         )
         result = server.wait(timeout_s=args.timeout)
     finally:
         server.stop()
 
-    if result.request_token is None:
-        reason = result.error or "unknown"
-        hint = ""
-        if reason == "timeout":
-            hint = (
-                "\nNo callback arrived. Common causes:\n"
-                f"  - Your Kite app's redirect URI is not {redirect_uri!r}\n"
-                "    (must match exactly, including port + trailing slash).\n"
-                "  - You signed in on a different machine and the 302 didn't\n"
-                "    reach this listener. Re-run on the same machine, or set\n"
-                "    up `ssh -L 5000:127.0.0.1:5000` and sign in on your laptop.\n"
-                "  - You cancelled the login / closed the tab.\n"
-                "Retry, or use `--paste` to skip the listener."
-            )
-        elif reason == "csrf_mismatch":
-            hint = (
-                "\nCSRF state mismatch: the callback did not carry the nonce\n"
-                "this process generated. Re-run `login`; do not reuse a login\n"
-                "URL from a previous attempt."
-            )
-        elif reason.startswith("bad_status"):
-            hint = (
-                "\nKite returned an error status in the redirect (usually\n"
-                "because the user is not enabled on the app, or the api_key\n"
-                "is wrong). Check the developer console."
-            )
-        print(f"ERROR: callback {reason}{hint}", file=sys.stderr)
-        return 1
+    if result.request_token is not None:
+        return _exchange_and_save(client, cfg, result.request_token, args)
 
-    return _exchange_and_save(client, cfg, result.request_token, args)
+    reason = result.error or "unknown"
+
+    # Auto-fallback to paste on timeout (remote-login scenario: callback
+    # went to the phone's localhost, not ours). Interactive only.
+    if reason == "timeout" and sys.stdin.isatty() and not args.no_fallback:
+        print(
+            "\nNo callback received within the timeout.\n"
+            "This is normal if you signed in on a different machine (phone,\n"
+            "laptop) — the 302 redirect hit THAT machine's 127.0.0.1:PORT,\n"
+            "not this one's. Paste the callback URL to finish.\n",
+            file=sys.stderr,
+        )
+        return _paste_flow(client, cfg, args)
+
+    hint = ""
+    if reason == "timeout":
+        hint = (
+            "\nNo callback arrived. Common causes:\n"
+            f"  - Your Kite app's redirect URI is not {redirect_uri!r}\n"
+            "    (must match exactly, including port + trailing slash).\n"
+            "    Check developers.kite.trade/apps; or pass\n"
+            "    --kite-redirect-uri http://127.0.0.1:PORT/ to bind to the\n"
+            "    registered port automatically.\n"
+            "  - You signed in on a different machine; use `ssh -L 5000:127.0.0.1:5000`\n"
+            "    OR retry with --paste and paste the browser's URL.\n"
+            "  - You cancelled the login / closed the tab."
+        )
+    elif reason == "csrf_mismatch":
+        hint = (
+            "\nCSRF state mismatch: callback did not carry the nonce this\n"
+            "process generated. Re-run `login`; do not reuse a stale URL."
+        )
+    elif reason.startswith("bad_status"):
+        hint = (
+            "\nKite returned an error status in the redirect (usually the\n"
+            "user is not enabled on the app, or the api_key is wrong)."
+        )
+    print(f"ERROR: callback {reason}{hint}", file=sys.stderr)
+    return 1
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
@@ -3278,8 +3389,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "waiting longer.")
     s.add_argument("--paste", action="store_true",
                    help="Skip the listener; print the login URL and prompt to "
-                        "paste request_token. Use this when the listener can't "
-                        "be reached (no SSH tunnel available, sandboxed runner).")
+                        "paste the full callback URL OR bare request_token. "
+                        "Use this for sandboxed runners or remote logins where "
+                        "the listener can't be reached.")
+    s.add_argument("--kite-redirect-uri", dest="kite_redirect_uri", default=None,
+                   metavar="URL",
+                   help="Pass your Kite app's registered redirect URI (e.g. "
+                        "'http://127.0.0.1:5000/'). The listener auto-picks "
+                        "the port from this URL so you never hit a port "
+                        "mismatch. Mutually exclusive in intent with --listen-port.")
+    s.add_argument("--no-fallback", action="store_true",
+                   help="Disable the auto paste-mode fallback on listener "
+                        "timeout. Useful for non-interactive runners that want "
+                        "a hard error instead of a getpass prompt.")
 
     add("profile", cmd_profile, "User profile (verify session)")
     add("session", cmd_session, "Current session status + approx expiry")
