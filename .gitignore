@@ -38,6 +38,9 @@ data/reports/
 ibkr_data_cache/
 kite_data_cache/
 
+# Backtest CSV duplicates (keep .parquet only — same data, smaller)
+data/*.csv
+
 # Runtime state written by the engine / audit log / kill switch
 data/audit/
 data/idempotency.sqlite
