@@ -70,10 +70,31 @@ def test_none_mode_zero_cost() -> None:
     assert all(v == 0.0 for v in (bd.brokerage, bd.stt, bd.exchange, bd.sebi, bd.stamp, bd.ipft, bd.dp_charge, bd.gst))
 
 
-def test_options_raises_not_implemented() -> None:
+def test_options_round_trip_premium_100_to_80_1lot() -> None:
     model = IndianCostModel("options")
-    with pytest.raises(NotImplementedError):
-        model.compute_cost(100.0, 1, "buy", 75)
+    # Buy-to-open at premium 100, sell-to-close at 80; 1 lot of 75.
+    buy = model.compute_cost(price=100.0, qty_units=1, side="buy", lot_size=75)
+    sell = model.compute_cost(price=80.0, qty_units=1, side="sell", lot_size=75)
+
+    assert buy.brokerage == pytest.approx(20.0)
+    assert sell.brokerage == pytest.approx(20.0)
+    # STT 0.1% on the SELL leg only (notional = 80 * 75 = 6000)
+    assert buy.stt == pytest.approx(0.0)
+    assert sell.stt == pytest.approx(0.001 * 6_000)  # 6.0
+    # Exchange 0.03503% per leg
+    assert buy.exchange == pytest.approx(0.0003503 * 100 * 75)
+    assert sell.exchange == pytest.approx(0.0003503 * 80 * 75)
+    # Stamp 0.003% on the BUY leg only (notional = 100 * 75 = 7500)
+    assert buy.stamp == pytest.approx(0.00003 * 7_500)  # 0.225
+    assert sell.stamp == pytest.approx(0.0)
+
+    rt = model.round_trip_cost(entry_price=100.0, exit_price=80.0, qty_units=1, lot_size=75)
+    assert rt.brokerage == pytest.approx(40.0)
+    assert rt.stt == pytest.approx(6.0)
+    assert rt.stamp == pytest.approx(0.225)
+    expected_gst = 0.18 * (rt.brokerage + rt.exchange + rt.sebi)
+    assert rt.gst == pytest.approx(expected_gst, abs=0.01)
+    assert rt.total > rt.brokerage  # sanity: charges accumulate
 
 
 def test_invalid_inputs() -> None:
