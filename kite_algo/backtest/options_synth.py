@@ -36,6 +36,38 @@ def atm_strike(spot: float, step: int = 50) -> int:
     return int(round(spot / step) * step)
 
 
+def strike_at_delta(
+    spot: float,
+    expiry: pd.Timestamp,
+    now: pd.Timestamp,
+    iv: float,
+    right: Right,
+    target: float,
+    r: float = 0.065,
+    step: int = 50,
+    max_span: float = 3000.0,
+) -> int | None:
+    """First OTM strike whose |BSM delta| <= target, stepping away from spot.
+
+    For PE: the highest strike at/beyond the target delta (closest compliant
+    strike below spot); for CE the lowest such strike above spot. Returns None
+    if no strike within max_span qualifies. This is the mechanical proxy for
+    "sell at/behind the OI wall" — live calibration (Jul 2026) put the 2nd/3rd
+    OI walls at |delta| 0.19-0.28 and actual wall-tucked entries at 0.09-0.15.
+    """
+    from kite_algo.greeks import bs_delta
+
+    if not 0 < target < 0.5:
+        raise ValueError(f"target delta must be in (0, 0.5), got {target}")
+    T = years_to_expiry(now, expiry)
+    k = (int(spot // step) * step) if right == "PE" else (int(spot // step) * step + step)
+    while abs(k - spot) <= max_span:
+        if abs(bs_delta(spot, k, T, r, iv, right)) <= target:
+            return k
+        k += -step if right == "PE" else step
+    return None
+
+
 def years_to_expiry(now: pd.Timestamp, expiry: pd.Timestamp, basis: float = 365.0) -> float:
     """Annualised time-to-expiry between two instants, floored at 0."""
     return max((expiry - now).total_seconds() / (basis * _SECONDS_PER_DAY), 0.0)

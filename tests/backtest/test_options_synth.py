@@ -8,6 +8,7 @@ import pytest
 from kite_algo.backtest.options_synth import (
     atm_strike,
     price_path,
+    strike_at_delta,
     vertical_spread_path,
     years_to_expiry,
 )
@@ -50,6 +51,28 @@ def test_price_path_decays_toward_intrinsic_at_expiry() -> None:
     ce = price_path(df, strike=24_000, expiry=exp, right="CE", iv=0.15)
     assert ce.iloc[0] > 200.0          # time value present 2h before expiry
     assert ce.iloc[1] == pytest.approx(200.0, abs=1e-6)  # intrinsic only at expiry
+
+
+def test_strike_at_delta_picks_otm_compliant_strike() -> None:
+    from kite_algo.greeks import bs_delta
+
+    now = pd.Timestamp("2026-07-01 09:45", tz="UTC")
+    exp = pd.Timestamp("2026-07-07 15:30", tz="UTC")
+    spot, iv = 24_000.0, 0.14
+    T = years_to_expiry(now, exp)
+
+    kp = strike_at_delta(spot, exp, now, iv, "PE", 0.10)
+    kc = strike_at_delta(spot, exp, now, iv, "CE", 0.10)
+    assert kp is not None and kc is not None
+    assert kp < spot < kc
+    # chosen strike compliant, one step closer to spot is not
+    assert abs(bs_delta(spot, kp, T, 0.065, iv, "PE")) <= 0.10
+    assert abs(bs_delta(spot, kp + 50, T, 0.065, iv, "PE")) > 0.10
+    assert bs_delta(spot, kc, T, 0.065, iv, "CE") <= 0.10
+    assert bs_delta(spot, kc - 50, T, 0.065, iv, "CE") > 0.10
+
+    with pytest.raises(ValueError):
+        strike_at_delta(spot, exp, now, iv, "PE", 0.75)
 
 
 def test_vertical_spread_bounded_by_width() -> None:
