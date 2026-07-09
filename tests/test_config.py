@@ -25,6 +25,7 @@ from kite_algo.config import (
     atomic_write_text,
     load_session,
     save_session,
+    session_path,
 )
 
 
@@ -74,6 +75,20 @@ def test_session_roundtrip(tmp_path):
     loaded = load_session(path)
     assert loaded["access_token"] == "abc"
     assert loaded["user_id"] == "AB1234"
+
+
+def test_session_path_env_override_is_used_everywhere(monkeypatch, tmp_path):
+    path = tmp_path / "account-b" / "session.json"
+    monkeypatch.setenv("KITE_SESSION_PATH", str(path))
+    save_session({"access_token": "account-b-token", "user_id": "B123"})
+
+    assert session_path() == path
+    assert load_session()["access_token"] == "account-b-token"
+
+    monkeypatch.setenv("KITE_API_KEY", "key")
+    monkeypatch.setenv("KITE_API_SECRET", "secret")
+    monkeypatch.delenv("KITE_ACCESS_TOKEN", raising=False)
+    assert KiteConfig.from_env().access_token == "account-b-token"
 
 
 def test_session_file_owner_only_perms(tmp_path):
@@ -277,6 +292,12 @@ def test_assert_order_authorized_blocks_on_dry_run():
 def test_assert_order_authorized_blocks_without_live_enabled():
     cfg = TradingConfig(dry_run=False, allow_live=True, live_enabled=False)
     with pytest.raises(SystemExit):
+        cfg.assert_order_authorized(confirm_token=None)
+
+
+def test_assert_order_authorized_blocks_without_allow_live():
+    cfg = TradingConfig(dry_run=False, allow_live=False, live_enabled=True)
+    with pytest.raises(SystemExit, match="TRADING_ALLOW_LIVE=false"):
         cfg.assert_order_authorized(confirm_token=None)
 
 

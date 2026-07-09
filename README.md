@@ -2,7 +2,9 @@
 
 Indian-market trading system on Kite Connect (Zerodha). Sibling to [trading-algo](https://github.com/mahimn01/trading-algo), which covers US equities and crypto through Interactive Brokers. Wired for NSE, BSE, NFO, MCX, and CDS.
 
-Right now it's mostly scaffolding and the read-only side. Order routing, strategies, and the engine loop are stubbed and being filled in.
+The project includes the read-only data surface, guarded order routing,
+strategy engine, risk manager, OMS, persistence, reconciliation, and a
+deterministic simulator/backtesting stack.
 
 ## Quickstart
 
@@ -29,7 +31,7 @@ Every command supports `--format json|csv|table`.
 | Historical statements | Flex Web Service, 365 days | None, pull from Console web UI CSV |
 | Live data | Single call for snap + stream | REST `/quote` for snapshots, KiteTicker WebSocket for streaming |
 | Greeks | From API | Compute locally with Black-Scholes |
-| Rate limits | ~50 req/s | 3 req/s most endpoints, 10 req/s on `/quote` |
+| Rate limits | ~50 req/s | Separate buckets: quote 1/s, historical 3/s, general 10/s, orders 10/s + 200/min + 3000/day |
 | Instruments | Live lookup | 70MB CSV dump refreshed daily ~8:30am IST |
 | Product types | Margin vs cash | `CNC` (delivery), `MIS` (intraday, auto-square 15:20), `NRML` (F&O carry) |
 | Market hours | US 09:30–16:00 ET | NSE 09:15–15:30 IST, MCX 09:00–23:30 IST, CDS 09:00–17:00 IST |
@@ -50,7 +52,13 @@ Every command supports `--format json|csv|table`.
 
 ## Safety rails
 
-Same layered pattern as trading-algo. `TRADING_ALLOW_LIVE=true` is required. `TRADING_DRY_RUN=true` stages orders without transmitting. Every order-placing CLI command needs `--yes` plus a matching `TRADING_ORDER_TOKEN` / `--confirm-token`. The broker calls prompt for `YES` at the terminal.
+Same layered pattern as trading-algo. Both `TRADING_ALLOW_LIVE=true` and
+`TRADING_LIVE_ENABLED=true` are required, while `TRADING_DRY_RUN` must be
+false. `TRADING_DRY_RUN=true` forces `place` into margin-preview mode and
+blocks every other write. Every write command requires `--yes`; when
+`TRADING_CONFIRM_TOKEN_REQUIRED=true`, `--confirm-token` must also match
+`TRADING_ORDER_TOKEN`. `cancel-all` and `convert-position` have additional,
+operation-specific acknowledgements.
 
 Full safety model in `docs/SAFETY.md`.
 
@@ -108,7 +116,7 @@ TRADING_DRY_RUN=true
 | Engine / OMS / Risk / Persistence | done |
 | Kill switch (`halt` / `resume`) | done |
 | Structured envelope + exit-code taxonomy | done |
-| SEBI-compliant audit log (`data/audit/*.jsonl`) + `events` | done |
+| Redacted local audit log (`data/audit/*.jsonl`) + `events` | done |
 | Multi-leg transaction groups + `reconcile` | done |
 | Alerts API (raw HTTP) | done |
 | Instruments cache (daily dump, atomic writes) | done |
@@ -118,7 +126,7 @@ TRADING_DRY_RUN=true
 | `--idempotency-key` crash-safe replay cache | done |
 | Strategies (agent-driven; no in-repo strategies) | out of scope |
 | Backtesting | out of scope |
-| Tests (731 passing) | done |
+| Automated regression suite | done |
 
 ## Related
 

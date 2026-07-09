@@ -165,29 +165,41 @@ def atomic_write_text(path: Path, data: str, *, mode: int = 0o600) -> None:
 DEFAULT_SESSION_PATH = Path("data/session.json")
 
 
-def load_session(path: Path = DEFAULT_SESSION_PATH) -> dict:
+def session_path() -> Path:
+    """Return the effective session path.
+
+    ``KITE_SESSION_PATH`` is documented as the multi-account/session-isolation
+    override.  Resolving it in one place prevents auth, logout, redaction, and
+    status commands from silently disagreeing about which token is active.
+    """
+    raw = os.getenv("KITE_SESSION_PATH")
+    return Path(raw).expanduser() if raw else DEFAULT_SESSION_PATH
+
+
+def load_session(path: Path | None = None) -> dict:
     """Load the cached Kite session (access_token + metadata).
 
     Returns `{}` on missing or malformed file. The caller treats that as
     "no session — run login". We never raise on decode errors because a
     half-written file from a crashed `login` shouldn't block recovery.
     """
-    if not path.exists():
+    resolved = path or session_path()
+    if not resolved.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(resolved.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
 
 
-def save_session(data: dict, path: Path = DEFAULT_SESSION_PATH) -> None:
+def save_session(data: dict, path: Path | None = None) -> None:
     """Write session atomically at mode 0o600.
 
     The file contains a live access token valid for the rest of the trading
     day.  Atomic rename guarantees the file is never visible in a truncated
     state even if the process is killed mid-write.
     """
-    atomic_write_text(path, json.dumps(data, indent=2), mode=0o600)
+    atomic_write_text(path or session_path(), json.dumps(data, indent=2), mode=0o600)
 
 
 def get_access_token() -> str:
@@ -288,13 +300,27 @@ class TradingConfig:
             kite=KiteConfig.from_env(),
         )
 
-    def assert_order_authorized(self, confirm_token: str | None = None) -> None:
-        """Second safety gate before any real order submission."""
+    def assert_order_authorized(
+        self,
+        confirm_token: str | None = None,
+        *,
+        action: str = "perform a live broker write",
+    ) -> None:
+        """Fail closed unless a live broker write is explicitly authorised.
+
+        Dry-run callers are safe and return immediately.  Every real write
+        must independently satisfy both live gates; checking only
+        ``TRADING_LIVE_ENABLED`` would make ``TRADING_ALLOW_LIVE`` cosmetic.
+        """
         if self.dry_run:
             return
+        if not self.allow_live:
+            raise SystemExit(
+                f"Refusing to {action} with TRADING_ALLOW_LIVE=false."
+            )
         if not self.live_enabled:
             raise SystemExit(
-                "Refusing to place live orders with TRADING_LIVE_ENABLED=false."
+                f"Refusing to {action} with TRADING_LIVE_ENABLED=false."
             )
         if self.confirm_token_required:
             if not self.order_token:
@@ -304,7 +330,7 @@ class TradingConfig:
                 )
             if confirm_token != self.order_token:
                 raise SystemExit(
-                    "Refusing to place live orders: --confirm-token did not match "
+                    f"Refusing to {action}: --confirm-token did not match "
                     "TRADING_ORDER_TOKEN."
                 )
 

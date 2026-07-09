@@ -1,12 +1,11 @@
-"""NDJSON audit log for SEBI-compliant algorithmic trade records.
+"""NDJSON operator audit log for algorithmic trade records.
 
 Every CLI invocation appends one JSON line to a day-rotated file under
-`data/audit/YYYY-MM-DD.jsonl`. This is the compliance artifact: per
-SEBI's April 2026 retail algo circular, every algorithmic order must
-have a retained audit trail including timestamp, agent/algo identifier,
-and request parameters. Retention: 5 years per algo circular, 8 years
-under the broader 2026 stock-broker regulations — we default to 8 to
-cover the stricter bound.
+`data/audit/YYYY-MM-DD.jsonl`. This is a local reconciliation artifact with
+timestamps, agent/algo identifiers, request parameters, and broker outcomes.
+The broker/exchange remains the regulatory system of record. The eight-year
+constant is a conservative local retention target, not a claim that mutable
+local files are compliant archival storage.
 
 Why NDJSON + daily rotation (not SQLite)?
 
@@ -54,7 +53,8 @@ from kite_algo.redaction import redact_text
 
 DEFAULT_AUDIT_DIR = Path("data/audit")
 
-# SEBI stock-broker 2026 rule. 8 years > 5 algo-circular requirement.
+# Conservative local target; external regulated retention remains the
+# broker/exchange's responsibility.
 RETENTION_YEARS = 8
 
 
@@ -89,6 +89,12 @@ def _redact_args(args: dict) -> dict:
     """
     out: dict[str, Any] = {}
     for k, v in args.items():
+        if k.lower() in {
+            "access_token", "refresh_token", "public_token", "request_token",
+            "api_secret", "order_token", "confirm_token", "password", "totp",
+        }:
+            out[k] = "***REDACTED***" if v not in (None, "") else v
+            continue
         if isinstance(v, str):
             out[k] = redact_text(v)
         elif isinstance(v, (dict, list)):
@@ -211,7 +217,7 @@ def log_command(
         parent_request_id=parent_request_id,
         strategy_id=strategy_id,
         agent_id=agent_id,
-        extra=extra or {},
+        extra=_redact_args(extra or {}),
     )
     return write_entry(entry, root=root)
 
@@ -304,8 +310,8 @@ def tail(
 def purge_older_than(days: int, *, root: Path | None = None) -> int:
     """Delete audit files older than `days` days. Returns number deleted.
 
-    Default SEBI retention: 8 years ≈ 2920 days. Operators that don't need
-    full retention (e.g. paper/testing) can call this with a shorter cutoff.
+    The conservative local target is 8 years ≈ 2920 days. Operators using
+    paper/testing roots can call this with a shorter cutoff.
     """
     root = root or audit_dir()
     if not root.exists():

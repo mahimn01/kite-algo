@@ -30,11 +30,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kite_algo.config import (
-    DEFAULT_SESSION_PATH,
     KiteConfig,
+    TradingConfig,
     load_dotenv,
     load_session,
     save_session,
+    session_path,
 )
 from kite_algo.logging_setup import configure_logging
 from kite_algo.resilience import (
@@ -93,6 +94,28 @@ install_logging_filter()
 log = logging.getLogger("kite_tool")
 
 _RATE_LIMITER = KiteRateLimiter()
+
+
+def _set_audit_context(
+    args: argparse.Namespace,
+    *,
+    kite_order_id: str | None = None,
+    kite_request_id: str | None = None,
+    **extra: Any,
+) -> None:
+    """Attach broker outcome metadata for ``main()``'s final audit record.
+
+    Command handlers still return the stable integer exit-code contract.  The
+    private namespace attributes provide a narrow side channel for IDs and
+    result details that only become known after the broker call completes.
+    """
+    if kite_order_id is not None:
+        setattr(args, "_audit_kite_order_id", str(kite_order_id))
+    if kite_request_id is not None:
+        setattr(args, "_audit_kite_request_id", str(kite_request_id))
+    current = dict(getattr(args, "_audit_extra", {}) or {})
+    current.update({k: v for k, v in extra.items() if v is not None})
+    setattr(args, "_audit_extra", current)
 
 
 def _import_kiteconnect() -> Any:
@@ -298,7 +321,7 @@ def _exchange_and_save(
         "login_time": datetime.now().isoformat(timespec="seconds"),
     }
     save_session(session)
-    print(f"\nAccess token saved to {DEFAULT_SESSION_PATH}", file=sys.stderr)
+    print(f"\nAccess token saved to {session_path()}", file=sys.stderr)
 
     # Refresh the redaction filter so the brand-new access_token is
     # redacted from any subsequent log line within this process.
@@ -559,7 +582,7 @@ def cmd_profile(args: argparse.Namespace) -> int:
 def cmd_session(args: argparse.Namespace) -> int:
     data = load_session()
     if not data:
-        print("No session cached at", DEFAULT_SESSION_PATH)
+        print("No session cached at", session_path())
         return 1
     login_time_str = data.get("login_time") or ""
     try:
@@ -602,7 +625,7 @@ def cmd_health(args: argparse.Namespace) -> int:
 
     # 1. Session file present
     sess = load_session()
-    record("session_file", bool(sess), DEFAULT_SESSION_PATH.name if sess else "missing — run `login`")
+    record("session_file", bool(sess), session_path().name if sess else "missing — run `login`")
 
     if not sess:
         _emit(checks, args.format, cmd=args.cmd)
@@ -788,6 +811,7 @@ def cmd_alerts_get(args: argparse.Namespace) -> int:
 def cmd_alerts_create(args: argparse.Namespace) -> int:
     _require_yes(args, "create an alert")
     _require_not_halted("create an alert")
+    _require_write_authorized(args, "create an alert")
     client = _new_alerts_client()
 
     payload: dict[str, Any] = {
@@ -819,6 +843,8 @@ def cmd_alerts_create(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"ERROR: alerts create failed: {redact_text(str(exc))}", file=sys.stderr)
         return 1
+    if isinstance(data, dict):
+        _set_audit_context(args, alert_uuid=data.get("uuid"), result=data)
     _emit(data, args.format, cmd=args.cmd)
     return 0
 
@@ -826,6 +852,7 @@ def cmd_alerts_create(args: argparse.Namespace) -> int:
 def cmd_alerts_modify(args: argparse.Namespace) -> int:
     _require_yes(args, "modify an alert")
     _require_not_halted("modify an alert")
+    _require_write_authorized(args, "modify an alert")
     client = _new_alerts_client()
 
     payload: dict[str, Any] = {}
@@ -845,6 +872,7 @@ def cmd_alerts_modify(args: argparse.Namespace) -> int:
             return 2
 
     data = client.modify(args.uuid, payload)
+    _set_audit_context(args, alert_uuid=args.uuid, result=data)
     _emit(data, args.format, cmd=args.cmd)
     return 0
 
@@ -852,8 +880,10 @@ def cmd_alerts_modify(args: argparse.Namespace) -> int:
 def cmd_alerts_delete(args: argparse.Namespace) -> int:
     _require_yes(args, "delete an alert")
     _require_not_halted("delete an alert")
+    _require_write_authorized(args, "delete an alert")
     client = _new_alerts_client()
     data = client.delete(args.uuid)
+    _set_audit_context(args, alert_uuid=args.uuid, deleted=True, result=data)
     _emit({"deleted": args.uuid, "response": data}, args.format, cmd=args.cmd)
     return 0
 
@@ -1112,6 +1142,7 @@ def cmd_group_cancel(args: argparse.Namespace) -> int:
     """Cancel every still-open leg of a group. --yes required."""
     _require_yes(args, "cancel all open legs in a group")
     _require_not_halted("cancel all open legs in a group")
+    _require_write_authorized(args, "cancel all open legs in a group")
 
     from kite_algo.groups import GroupStore
     store = GroupStore()
@@ -1153,6 +1184,13 @@ def cmd_group_cancel(args: argparse.Namespace) -> int:
     # Mark the group closed since we've attempted to flatten it.
     store.close(g.id)
 
+    _set_audit_context(
+        args,
+        group_id=g.id,
+        cancelled_order_ids=cancelled,
+        failed=failed,
+    )
+
     _emit({
         "group_id": g.id,
         "cancelled": cancelled,
@@ -1168,7 +1206,7 @@ def cmd_group_cancel(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def cmd_events(args: argparse.Namespace) -> int:
-    """Read the SEBI-compliant audit log under data/audit/*.jsonl.
+    """Read the local operator audit log under data/audit/*.jsonl.
 
     This is where agents reconstruct their own history after a crash,
     verify that a given request_id actually ran, or diff their assumptions
@@ -1607,9 +1645,10 @@ def cmd_logout(args: argparse.Namespace) -> int:
         client.invalidate_access_token()
     except Exception as exc:
         print(f"WARN: invalidate_access_token failed: {exc}", file=sys.stderr)
-    if DEFAULT_SESSION_PATH.exists():
-        DEFAULT_SESSION_PATH.unlink()
-        print(f"Removed {DEFAULT_SESSION_PATH}", file=sys.stderr)
+    active_session_path = session_path()
+    if active_session_path.exists():
+        active_session_path.unlink()
+        print(f"Removed {active_session_path}", file=sys.stderr)
     return 0
 
 
@@ -1810,6 +1849,7 @@ def cmd_convert_position(args: argparse.Namespace) -> int:
             "--confirm-convert forces explicit acknowledgment."
         )
     _require_not_halted("convert a position")
+    _require_write_authorized(args, "convert a position")
     client = _new_client()
     try:
         client.convert_position(
@@ -1824,6 +1864,15 @@ def cmd_convert_position(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"ERROR: convert_position failed: {exc}", file=sys.stderr)
         return 1
+    _set_audit_context(
+        args,
+        converted=True,
+        exchange=args.exchange,
+        tradingsymbol=args.tradingsymbol,
+        quantity=args.quantity,
+        old_product=args.old_product,
+        new_product=args.new_product,
+    )
     print(
         f"converted: {args.tradingsymbol} {args.quantity}x "
         f"{args.old_product}→{args.new_product}",
@@ -2742,6 +2791,35 @@ def _require_not_halted(action: str) -> None:
         )
 
 
+def _require_write_authorized(
+    args: argparse.Namespace,
+    action: str,
+    *,
+    allow_dry_run: bool = False,
+) -> bool:
+    """Enforce the same environment gates as :class:`KiteBroker`.
+
+    Returns ``True`` only when the caller must execute its read-only dry-run
+    path.  Every other successful return represents an explicitly authorised
+    live write.  Keeping this check in the data/ops CLI closes the historical
+    bypass where ``--yes`` alone could call ``KiteConnect`` directly.
+    """
+    cfg = TradingConfig.from_env()
+    effective_dry_run = cfg.dry_run or bool(getattr(args, "dry_run", False))
+    if effective_dry_run:
+        if allow_dry_run:
+            return True
+        raise SystemExit(
+            f"Refusing to {action}: dry-run mode is active. Set "
+            "TRADING_DRY_RUN=false for a real broker write."
+        )
+    cfg.assert_order_authorized(
+        getattr(args, "confirm_token", None),
+        action=action,
+    )
+    return False
+
+
 def cmd_place(args: argparse.Namespace) -> int:
     """Place a single order via Kite Connect.
 
@@ -2754,6 +2832,10 @@ def cmd_place(args: argparse.Namespace) -> int:
     """
     _require_yes(args, "place an order")
     _require_not_halted("place an order")
+    effective_dry_run = _require_write_authorized(
+        args, "place an order", allow_dry_run=True,
+    )
+    _set_audit_context(args, dry_run=effective_dry_run)
 
     # Default market_protection for MARKET/SL-M when not explicitly set: -1 =
     # Kite auto. Post-SEBI April 2026, omitting market_protection from MARKET
@@ -2842,7 +2924,7 @@ def cmd_place(args: argparse.Namespace) -> int:
     # This endpoint is read-only — it computes margin requirements without
     # transmitting. We whitelist fields explicitly and omit price for MARKET
     # orders (order_margins rejects price=0 with an InputException).
-    if args.dry_run:
+    if effective_dry_run:
         preview_order: dict[str, Any] = {
             "exchange": args.exchange,
             "tradingsymbol": args.tradingsymbol,
@@ -2866,6 +2948,7 @@ def cmd_place(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"ERROR: dry-run margin preview failed: {_redact_secrets(str(exc))}", file=sys.stderr)
             return 1
+        _set_audit_context(args, margin_preview=preview)
         print(
             "=== DRY RUN — margin preview only. NO order transmitted. ===",
             file=sys.stderr,
@@ -2897,6 +2980,12 @@ def cmd_place(args: argparse.Namespace) -> int:
             if isinstance(replayed, dict):
                 replayed = {**replayed, "replayed": True,
                             "first_seen_at_ms": existing.first_seen_at_ms}
+                _set_audit_context(
+                    args,
+                    kite_order_id=replayed.get("order_id"),
+                    replayed=True,
+                    final_status=replayed.get("final_status"),
+                )
             _emit(replayed, args.format, cmd=args.cmd)
             return existing.exit_code or 0
 
@@ -2959,6 +3048,16 @@ def cmd_place(args: argparse.Namespace) -> int:
         result["average_price"] = final_status.get("average_price")
         result["status_message"] = final_status.get("status_message")
 
+    _set_audit_context(
+        args,
+        kite_order_id=str(order_id),
+        tag=tag,
+        final_status=result.get("final_status", "SUBMITTED"),
+        filled_quantity=result.get("filled_quantity"),
+        group_id=result.get("group_id"),
+        leg_name=result.get("leg_name"),
+    )
+
     # Record completion in the idempotency cache before we emit, so a crash
     # between emission and subsequent retries still reconciles correctly.
     if idem_store is not None and idem_key:
@@ -2985,6 +3084,12 @@ def cmd_place(args: argparse.Namespace) -> int:
         except Exception as exc:
             log.warning("could not attach order to group %s: %s",
                         group_id, redact_text(str(exc)))
+
+    _set_audit_context(
+        args,
+        group_id=result.get("group_id"),
+        leg_name=result.get("leg_name"),
+    )
 
     _emit(result, args.format, cmd=args.cmd)
     return 0
@@ -3062,6 +3167,8 @@ def _wait_for_fill(client: Any, order_id: str, *, timeout: float) -> dict:
 def cmd_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel an order")
     _require_not_halted("cancel an order")
+    _require_write_authorized(args, "cancel an order")
+    _set_audit_context(args, kite_order_id=args.order_id, action="cancel")
     client = _new_client()
     client.cancel_order(variety=args.variety, order_id=args.order_id)
     print(f"cancel sent: variety={args.variety} order_id={args.order_id}", file=sys.stderr)
@@ -3071,6 +3178,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def cmd_modify(args: argparse.Namespace) -> int:
     _require_yes(args, "modify an order")
     _require_not_halted("modify an order")
+    _require_write_authorized(args, "modify an order")
+    _set_audit_context(args, kite_order_id=args.order_id, action="modify")
     # Kite caps modifications at ~25 per order lifetime. Track locally so we
     # fail fast rather than hit the server-side "Maximum allowed order
     # modifications exceeded" InputException.
@@ -3118,6 +3227,7 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
             "the agent to acknowledge the broader blast radius explicitly."
         )
     _require_not_halted("cancel ALL open orders")
+    _require_write_authorized(args, "cancel ALL open orders")
     client = _new_client()
     orders = client.orders() or []
     cancelled: list[str] = []
@@ -3146,6 +3256,11 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
         "total_cancelled": len(cancelled),
         "total_failed": len(failed),
     }
+    _set_audit_context(
+        args,
+        cancelled_order_ids=cancelled,
+        failed=failed,
+    )
     _emit(result, args.format, cmd=args.cmd)
     return 0 if not failed else 1
 
@@ -3169,8 +3284,10 @@ def cmd_gtt_get(args: argparse.Namespace) -> int:
 def cmd_gtt_delete(args: argparse.Namespace) -> int:
     _require_yes(args, "delete a GTT")
     _require_not_halted("delete a GTT")
+    _require_write_authorized(args, "delete a GTT")
     client = _new_client()
     client.delete_gtt(trigger_id=args.trigger_id)
+    _set_audit_context(args, gtt_trigger_id=args.trigger_id, deleted=True)
     print(f"deleted gtt trigger_id={args.trigger_id}", file=sys.stderr)
     return 0
 
@@ -3183,6 +3300,7 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
     """
     _require_yes(args, "create a GTT")
     _require_not_halted("create a GTT")
+    _require_write_authorized(args, "create a GTT")
     client = _new_client()
 
     trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
@@ -3235,6 +3353,7 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
         return 1
 
     print(f"GTT created: trigger_id={trigger_id}", file=sys.stderr)
+    _set_audit_context(args, gtt_trigger_id=trigger_id, created=True)
     _emit({"trigger_id": trigger_id}, args.format, cmd=args.cmd)
     return 0
 
@@ -3243,6 +3362,7 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
     """Modify an existing GTT trigger."""
     _require_yes(args, "modify a GTT")
     _require_not_halted("modify a GTT")
+    _require_write_authorized(args, "modify a GTT")
     client = _new_client()
 
     trigger_values = [float(v.strip()) for v in args.trigger_values.split(",")]
@@ -3275,6 +3395,7 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
         return 1
 
     print(f"GTT modified: trigger_id={trigger_id}", file=sys.stderr)
+    _set_audit_context(args, gtt_trigger_id=trigger_id, modified=True)
     _emit({"trigger_id": trigger_id}, args.format, cmd=args.cmd)
     return 0
 
@@ -3323,6 +3444,10 @@ def cmd_basket_margin(args: argparse.Namespace) -> int:
 # MUTUAL FUNDS
 # =============================================================================
 
+class MFCapabilityUnavailable(RuntimeError):
+    """The authenticated account/session does not expose Kite MF APIs."""
+
+
 def _mf_subscription_hint() -> str:
     return (
         "Mutual fund API requires a separate Kite Connect MF subscription. "
@@ -3330,10 +3455,34 @@ def _mf_subscription_hint() -> str:
     )
 
 
+def _call_mf(client: Any, method_name: str, **kwargs: Any) -> Any:
+    """Invoke an MF endpoint with an explicit account-capability preflight.
+
+    ``kiteconnect==5.1.0`` can raise a low-level ``TypeError`` while parsing
+    the error response for accounts without MF access.  That exception is
+    neither actionable nor evidence of an empty portfolio.  Profile exchange
+    capabilities let us fail deterministically before that SDK bug.
+    """
+    profile = client.profile() or {}
+    exchanges = {str(x).upper() for x in (profile.get("exchanges") or [])}
+    if "MF" not in exchanges:
+        raise MFCapabilityUnavailable(
+            "This Kite profile does not advertise the MF exchange capability; "
+            "mutual-fund holdings/orders/SIPs cannot be queried for this session."
+        )
+    try:
+        return getattr(client, method_name)(**kwargs)
+    except TypeError as exc:
+        raise MFCapabilityUnavailable(
+            f"kiteconnect could not parse the {method_name} response. Verify the "
+            "Kite Connect MF subscription and SDK compatibility."
+        ) from exc
+
+
 def cmd_mf_holdings(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_holdings(), args.format, cmd=args.cmd)
+        _emit(_call_mf(client, "mf_holdings"), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_holdings failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -3344,7 +3493,7 @@ def cmd_mf_holdings(args: argparse.Namespace) -> int:
 def cmd_mf_orders(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_orders(), args.format, cmd=args.cmd)
+        _emit(_call_mf(client, "mf_orders"), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_orders failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -3355,7 +3504,7 @@ def cmd_mf_orders(args: argparse.Namespace) -> int:
 def cmd_mf_sips(args: argparse.Namespace) -> int:
     client = _new_client()
     try:
-        _emit(client.mf_sips(), args.format, cmd=args.cmd)
+        _emit(_call_mf(client, "mf_sips"), args.format, cmd=args.cmd)
     except Exception as exc:
         print(f"ERROR: mf_sips failed: {exc}", file=sys.stderr)
         print(_mf_subscription_hint(), file=sys.stderr)
@@ -3373,9 +3522,12 @@ def cmd_mf_instruments(args: argparse.Namespace) -> int:
 def cmd_mf_place(args: argparse.Namespace) -> int:
     _require_yes(args, "place a mutual fund order")
     _require_not_halted("place a mutual fund order")
+    _require_write_authorized(args, "place a mutual fund order")
     client = _new_client()
     try:
-        order_id = client.place_mf_order(
+        order_id = _call_mf(
+            client,
+            "place_mf_order",
             tradingsymbol=args.tradingsymbol,
             transaction_type=args.transaction_type,
             quantity=args.quantity if args.quantity else None,
@@ -3386,6 +3538,7 @@ def cmd_mf_place(args: argparse.Namespace) -> int:
         print(f"ERROR: place_mf_order failed: {exc}", file=sys.stderr)
         return 1
     print(f"MF order placed: order_id={order_id}", file=sys.stderr)
+    _set_audit_context(args, kite_order_id=str(order_id), action="mf-place")
     _emit({"order_id": order_id}, args.format, cmd=args.cmd)
     return 0
 
@@ -3393,12 +3546,14 @@ def cmd_mf_place(args: argparse.Namespace) -> int:
 def cmd_mf_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel a mutual fund order")
     _require_not_halted("cancel a mutual fund order")
+    _require_write_authorized(args, "cancel a mutual fund order")
     client = _new_client()
     try:
-        client.cancel_mf_order(order_id=args.order_id)
+        _call_mf(client, "cancel_mf_order", order_id=args.order_id)
     except Exception as exc:
         print(f"ERROR: cancel_mf_order failed: {exc}", file=sys.stderr)
         return 1
+    _set_audit_context(args, kite_order_id=args.order_id, action="mf-cancel")
     print(f"MF order cancelled: order_id={args.order_id}", file=sys.stderr)
     return 0
 
@@ -3406,9 +3561,12 @@ def cmd_mf_cancel(args: argparse.Namespace) -> int:
 def cmd_mf_sip_create(args: argparse.Namespace) -> int:
     _require_yes(args, "create a mutual fund SIP")
     _require_not_halted("create a mutual fund SIP")
+    _require_write_authorized(args, "create a mutual fund SIP")
     client = _new_client()
     try:
-        sip_id = client.place_mf_sip(
+        sip_id = _call_mf(
+            client,
+            "place_mf_sip",
             tradingsymbol=args.tradingsymbol,
             amount=args.amount,
             initial_amount=args.initial_amount,
@@ -3420,6 +3578,7 @@ def cmd_mf_sip_create(args: argparse.Namespace) -> int:
         print(f"ERROR: place_mf_sip failed: {exc}", file=sys.stderr)
         return 1
     print(f"SIP created: sip_id={sip_id}", file=sys.stderr)
+    _set_audit_context(args, mf_sip_id=sip_id, created=True)
     _emit({"sip_id": sip_id}, args.format, cmd=args.cmd)
     return 0
 
@@ -3427,6 +3586,7 @@ def cmd_mf_sip_create(args: argparse.Namespace) -> int:
 def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
     _require_yes(args, "modify a mutual fund SIP")
     _require_not_halted("modify a mutual fund SIP")
+    _require_write_authorized(args, "modify a mutual fund SIP")
     client = _new_client()
     kwargs: dict[str, Any] = {"sip_id": args.sip_id}
     if args.amount is not None:
@@ -3438,10 +3598,11 @@ def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
     if args.status:
         kwargs["status"] = args.status
     try:
-        client.modify_mf_sip(**kwargs)
+        _call_mf(client, "modify_mf_sip", **kwargs)
     except Exception as exc:
         print(f"ERROR: modify_mf_sip failed: {exc}", file=sys.stderr)
         return 1
+    _set_audit_context(args, mf_sip_id=args.sip_id, modified=True)
     print(f"SIP modified: sip_id={args.sip_id}", file=sys.stderr)
     return 0
 
@@ -3449,12 +3610,14 @@ def cmd_mf_sip_modify(args: argparse.Namespace) -> int:
 def cmd_mf_sip_cancel(args: argparse.Namespace) -> int:
     _require_yes(args, "cancel a mutual fund SIP")
     _require_not_halted("cancel a mutual fund SIP")
+    _require_write_authorized(args, "cancel a mutual fund SIP")
     client = _new_client()
     try:
-        client.cancel_mf_sip(sip_id=args.sip_id)
+        _call_mf(client, "cancel_mf_sip", sip_id=args.sip_id)
     except Exception as exc:
         print(f"ERROR: cancel_mf_sip failed: {exc}", file=sys.stderr)
         return 1
+    _set_audit_context(args, mf_sip_id=args.sip_id, cancelled=True)
     print(f"SIP cancelled: sip_id={args.sip_id}", file=sys.stderr)
     return 0
 
@@ -3525,6 +3688,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _add_yes(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--yes", action="store_true", help="Required live confirmation flag")
+        sp.add_argument(
+            "--confirm-token",
+            default=None,
+            help=(
+                "Must match TRADING_ORDER_TOKEN when "
+                "TRADING_CONFIRM_TOKEN_REQUIRED=true. Treat as sensitive; "
+                "prefer a short-lived operator token."
+            ),
+        )
 
     # --- meta (tools describe) ---
     # Emits JSONSchema for every subcommand — ready to register directly as
@@ -3657,7 +3829,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- audit log tail ---
     s = add("events", cmd_events,
-            "Tail the local SEBI-compliant audit log (data/audit/*.jsonl)")
+            "Tail the local operator audit log (data/audit/*.jsonl)")
     s.add_argument("--since", default=None, metavar="YYYY-MM-DD",
                    help="Lower date bound (inclusive, IST)")
     s.add_argument("--until", default=None, metavar="YYYY-MM-DD",
@@ -4033,13 +4205,17 @@ def main(argv: list[str] | None = None) -> int:
         _emit(explain(args.cmd), args.format, cmd=args.cmd)
         return 0
 
-    # SEBI-compliant audit: log every invocation exactly once, with outcome.
+    # Local operator audit: log every invocation exactly once, with outcome.
     request_id = new_request_id()
     started_ms = int(time.time() * 1000)
     args_for_log = {
         k: v for k, v in vars(args).items()
-        if k not in ("func",) and not callable(v)
+        if k not in ("func", "confirm_token")
+        and not k.startswith("_audit_")
+        and not callable(v)
     }
+    if hasattr(args, "confirm_token"):
+        args_for_log["confirm_token_present"] = bool(args.confirm_token)
     rc: int = 0
     err_code: str | None = None
     try:
@@ -4066,6 +4242,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         try:
             elapsed = int(time.time() * 1000) - started_ms
+            audit_extra = dict(getattr(args, "_audit_extra", {}) or {})
+            configured_user_id = os.getenv("KITE_USER_ID")
+            cached_user_id = (load_session() or {}).get("user_id")
+            kite_user_id = configured_user_id or cached_user_id
+            if kite_user_id:
+                audit_extra.setdefault("kite_user_id", kite_user_id)
             log_command(
                 cmd=args.cmd,
                 request_id=request_id,
@@ -4073,9 +4255,12 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code=rc,
                 error_code=err_code,
                 elapsed_ms=elapsed,
+                kite_request_id=getattr(args, "_audit_kite_request_id", None),
+                kite_order_id=getattr(args, "_audit_kite_order_id", None),
                 parent_request_id=parent_request_id(),
                 strategy_id=os.getenv("KITE_STRATEGY_ID"),
                 agent_id=os.getenv("KITE_AGENT_ID"),
+                extra=audit_extra or None,
             )
         except Exception:
             # Never let an audit-log failure crash the process.

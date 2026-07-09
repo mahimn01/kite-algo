@@ -44,12 +44,16 @@ python -m kite_algo.kite_tool chain --symbol NIFTY --expiry 2026-05-29 --quote -
 
 ## Order management (when write path is live)
 
+Before any real write, explicitly enable both live gates and disable dry-run.
+For higher assurance, also set `TRADING_CONFIRM_TOKEN_REQUIRED=true` and pass
+the configured operator token on each invocation.
+
 ```bash
 # Cancel one order
 python -m kite_algo.kite_tool cancel --order-id 240101000123456 --yes
 
 # Cancel everything open
-python -m kite_algo.kite_tool cancel-all --yes
+python -m kite_algo.kite_tool cancel-all --yes --confirm-panic
 
 # Modify qty/price
 python -m kite_algo.kite_tool modify --order-id 240101000123456 --quantity 100 --price 1250.50 --yes
