@@ -13,6 +13,9 @@
   `--confirm-token` is now consumed before a live Kite engine connects.
 - **Audit outcomes**: broker order IDs and GTT/SIP/alert/group results propagate
   into the final redacted NDJSON entry; confirmation secrets are excluded.
+- **GTT response integrity**: normalize Kite SDK create/modify responses to a
+  scalar trigger ID, fail closed on ambiguous post-mutation responses, and
+  prevent duplicate retries by directing operators to reconcile first.
 - **Session isolation**: `KITE_SESSION_PATH` now controls load, save, status,
   logout, and authentication consistently through one resolver.
 - **MF diagnostics**: accounts without the `MF` capability receive an

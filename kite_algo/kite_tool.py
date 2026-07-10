@@ -3269,6 +3269,28 @@ def cmd_cancel_all(args: argparse.Namespace) -> int:
 # GTT
 # =============================================================================
 
+def _normalize_gtt_trigger_id(response: Any, *, fallback: int | None = None) -> int:
+    """Return the scalar trigger ID from Kite SDK GTT mutation responses.
+
+    ``pykiteconnect`` returns ``{"trigger_id": 123}`` for GTT create/modify,
+    while older mocks and wrappers may return the scalar directly.  Keeping
+    this normalization at the broker boundary prevents nested public output
+    and non-scalar audit fields.  ``fallback`` is safe for modify operations
+    because their trigger ID is already known before the broker call.
+    """
+    candidate = response.get("trigger_id") if isinstance(response, dict) else response
+    if candidate is None and fallback is not None:
+        candidate = fallback
+    if isinstance(candidate, bool):
+        raise ValueError("boolean is not a valid GTT trigger ID")
+    try:
+        trigger_id = int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("broker response did not contain a scalar GTT trigger ID") from exc
+    if trigger_id <= 0:
+        raise ValueError("GTT trigger ID must be a positive integer")
+    return trigger_id
+
 def cmd_gtt_list(args: argparse.Namespace) -> int:
     client = _new_client()
     _emit(client.get_gtts(), args.format, cmd=args.cmd)
@@ -3340,7 +3362,7 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
             orders.append(order2)
 
     try:
-        trigger_id = client.place_gtt(
+        response = client.place_gtt(
             trigger_type=trigger_type,
             tradingsymbol=args.tradingsymbol,
             exchange=args.exchange,
@@ -3350,6 +3372,20 @@ def cmd_gtt_create(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(f"ERROR: place_gtt failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        trigger_id = _normalize_gtt_trigger_id(response)
+    except ValueError as exc:
+        # The broker mutation may already have succeeded.  A retry could
+        # create a duplicate trigger, so fail closed with an explicit
+        # reconciliation instruction instead of treating this as retryable.
+        _set_audit_context(args, gtt_response=response, outcome_uncertain=True)
+        print(
+            f"ERROR: GTT may have been created but its trigger ID could not be "
+            f"read: {exc}. DO NOT RETRY; run `gtt-list` to reconcile.",
+            file=sys.stderr,
+        )
         return 1
 
     print(f"GTT created: trigger_id={trigger_id}", file=sys.stderr)
@@ -3381,7 +3417,7 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        trigger_id = client.modify_gtt(
+        response = client.modify_gtt(
             trigger_id=args.trigger_id,
             trigger_type=trigger_type,
             tradingsymbol=args.tradingsymbol,
@@ -3392,6 +3428,19 @@ def cmd_gtt_modify(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(f"ERROR: modify_gtt failed: {exc}", file=sys.stderr)
+        return 1
+
+
+    try:
+        trigger_id = _normalize_gtt_trigger_id(response, fallback=args.trigger_id)
+    except ValueError as exc:
+        _set_audit_context(args, gtt_trigger_id=args.trigger_id, outcome_uncertain=True)
+        print(
+            f"ERROR: GTT modification may have succeeded but the broker "
+            f"response was invalid: {exc}. DO NOT RETRY; run `gtt-get` for "
+            f"trigger {args.trigger_id} to reconcile.",
+            file=sys.stderr,
+        )
         return 1
 
     print(f"GTT modified: trigger_id={trigger_id}", file=sys.stderr)
