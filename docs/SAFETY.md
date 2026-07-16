@@ -1,57 +1,86 @@
 # Safety Model
 
-Kite is live-money from day one — there is no paper account. Use `SimBroker`
-for offline testing.
+Kite is live-money from day one; there is no broker-provided paper account.
+Use `SimBroker` for offline execution tests.
 
-## Layers
+## Live-write authorization
 
-1. **Env var gates**
-   - `TRADING_BROKER=kite` — routes to live Kite
-   - `TRADING_BROKER=sim` — routes to SimBroker (always safe)
-   - `TRADING_ALLOW_LIVE=true` — required to enable live writes
-   - `TRADING_LIVE_ENABLED=true` — second gate, must also be true
-   - `TRADING_DRY_RUN=true` — short-circuits before any network write
+Every live write through either `kite_tool` or the strategy engine must pass
+all applicable layers:
 
-2. **CLI gates**
-   - Every order-placing command in `kite_tool` requires `--yes`
-   - `TRADING_CONFIRM_TOKEN_REQUIRED=true` forces `--confirm-token` to match
-     `TRADING_ORDER_TOKEN` on every call
+1. **Environment gates**
+   - `TRADING_BROKER=kite`
+   - `TRADING_ALLOW_LIVE=true`
+   - `TRADING_LIVE_ENABLED=true`
+   - `TRADING_DRY_RUN=false`
+2. **Invocation gate**
+   - Every `kite_tool` write command requires `--yes`.
+   - If `TRADING_CONFIRM_TOKEN_REQUIRED=true`, `--confirm-token` must match
+     `TRADING_ORDER_TOKEN`.
+3. **Destructive-operation acknowledgements**
+   - `cancel-all` additionally requires `--confirm-panic`.
+   - `convert-position` additionally requires `--confirm-convert`.
+4. **Kill switch**
+   - A `data/HALTED` sentinel blocks every trading write while leaving
+     read-only reconciliation commands available.
+5. **Broker adapter gate**
+   - `KiteBroker._require_live()` independently rechecks dry-run, both live
+     flags, and the halt sentinel.
 
-3. **Broker gate** (`KiteBroker._require_live`)
-   - Raises if `dry_run` is true
-   - Raises unless both `allow_live` and `live_enabled` are set
+`TRADING_DRY_RUN=true` forces `place` into the read-only `order_margins()`
+preview path even when `--dry-run` was omitted. Other write commands fail
+closed while dry-run is active because cancel/modify/GTT/MF writes do not have
+a meaningful preview operation.
 
-4. **Audit**
-   - Optional sqlite audit trail at `TRADING_DB_PATH` logs every order
-     request, response, and state change (implementation pending)
+Defaults are deliberately inert:
 
-## Defaults
+```dotenv
+TRADING_BROKER=kite
+TRADING_ALLOW_LIVE=false
+TRADING_LIVE_ENABLED=false
+TRADING_DRY_RUN=true
+TRADING_CONFIRM_TOKEN_REQUIRED=false
+```
 
-Everything defaults to safe:
-- `TRADING_DRY_RUN=true`
-- `TRADING_ALLOW_LIVE=false`
-- `TRADING_LIVE_ENABLED=false`
-- `TRADING_BROKER=kite` (but writes are blocked by the above)
+## Validation and resilience
 
-To actually place a live order you must:
-1. Set three env vars to their explicit "yes" values
-2. Run the command with `--yes`
-3. Respond to any interactive confirmation prompt
+- Local order validation rejects malformed payloads before any API call.
+- Market-hours, MIS-cutoff, freeze-quantity, and lot-size checks run before
+  placement unless an operator explicitly uses `--skip-market-rules`.
+- MARKET and SL-M orders receive `market_protection=-1` unless overridden.
+- Placement uses deterministic/idempotent tags and a durable replay cache.
+- Write traffic is limited to 10 requests/second, 200/minute, and 3000/day;
+  historical, quote, and general traffic use separate buckets.
+- Hard broker errors are never retried. Transient placement failures reconcile
+  against the live orderbook by tag before any retry.
 
-## Rate limits
+## Audit and reconciliation
 
-Kite's published limits:
-- 3 req/s on most endpoints
-- 10 req/s on `/quote` and `/ltp`
-- 200k calls/day cap
+Every normal `kite_tool` invocation appends one redacted NDJSON record under
+`data/audit/YYYY-MM-DD.jsonl` with mode `0600`. Write outcomes include broker
+order IDs or the relevant GTT/SIP/alert identifiers when available, plus the
+configured Kite user ID. Confirmation tokens and broker secrets are never
+persisted.
 
-The CLI doesn't currently enforce these (beyond what `kiteconnect` does
-internally). When the broker adapter grows a write path, we'll add a token
-bucket mirror of `trading_algo.broker.ibkr`'s `RateLimiter`.
+The strategy engine can additionally persist decisions, requests, responses,
+and status transitions to SQLite when `TRADING_DB_PATH` is configured.
 
-## Daily token expiry
+The local NDJSON files are an operator-side observability and reconciliation
+artifact. They are not WORM storage and do not replace Zerodha/exchange audit
+records. Production operators should back them up to access-controlled,
+retention-managed storage and periodically run `reconcile`.
 
-This is a **hard** safety property: if you haven't logged in today,
-everything fails closed. No cached token will bypass the 6am IST rotation.
-This is a feature, not a bug — it ensures at least one human action per day
-before any live order can go through.
+## Authentication
+
+Kite sessions expire daily. Login remains a human OAuth/2FA action: the tool
+may capture the loopback callback and exchange the one-time request token, but
+it never automates credentials or TOTP. The session is written atomically with
+mode `0600` to `data/session.json`, or to `KITE_SESSION_PATH` when configured.
+
+## External compliance dependency
+
+As of April 2026, Kite order placement must originate from a static public IP
+whitelisted in the Kite developer account. Read-only endpoints do not prove
+that this is configured. Verify primary/secondary IPs in
+`developers.kite.trade`; the broker will reject order writes from unapproved
+IPs.

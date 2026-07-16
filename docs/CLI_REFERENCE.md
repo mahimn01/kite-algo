@@ -84,36 +84,52 @@ orderbook polls).
 |------|-----------|---------|
 | `--format {json,csv,table}` | all | Output format. `json` is safest for downstream parsing. |
 | `--yes` | every write cmd | Explicit confirmation gate. All commands that place / modify / cancel **require** this. |
+| `--confirm-token TOKEN` | every write cmd | Required to match `TRADING_ORDER_TOKEN` when `TRADING_CONFIRM_TOKEN_REQUIRED=true`. Never persisted in audit logs. |
 
 ---
 
 ## Safety model
 
-This CLI has four independent safety layers. An agent must respect all of them.
+This CLI has independent, fail-closed safety layers. An agent must respect all
+of them.
 
-1. **`--yes` gate** — every write command refuses to execute without it.
+1. **Environment gates** — live writes require
+   `TRADING_ALLOW_LIVE=true`, `TRADING_LIVE_ENABLED=true`, and
+   `TRADING_DRY_RUN=false`. These are enforced in both the direct SDK CLI and
+   the broker adapter.
+
+2. **`--yes` gate** — every write command refuses to execute without it.
    Commands that require `--yes`: `place`, `cancel`, `modify`, `cancel-all`,
    `convert-position`, `gtt-create`, `gtt-modify`, `gtt-delete`, `mf-place`,
    `mf-cancel`, `mf-sip-create`, `mf-sip-modify`, `mf-sip-cancel`.
 
-2. **Pre-flight validation** — `place` runs 19+ client-side checks before any
+3. **Optional confirmation token** — when
+   `TRADING_CONFIRM_TOKEN_REQUIRED=true`, the invocation's `--confirm-token`
+   must match `TRADING_ORDER_TOKEN`.
+
+4. **Pre-flight validation** — `place` runs 19+ client-side checks before any
    API call. Invalid orders exit 1 with field-specific messages and **zero
    API quota consumed**.
 
-3. **Quantity guardrail** — `KITE_MAX_QUANTITY` env (default 100,000) catches
+5. **Quantity guardrail** — `KITE_MAX_QUANTITY` env (default 100,000) catches
    `--quantity` typos. Override for genuinely larger clips.
 
-4. **Idempotent placement** — every `place` auto-generates a unique tag (or
+6. **Idempotent placement** — every `place` auto-generates a unique tag (or
    accepts `--tag`). On transient failure, the placer polls the orderbook by
    tag before retrying. Never double-fills.
 
-5. **Dry-run** — `place --dry-run` calls `order_margins()` for a margin
+7. **Dry-run** — `place --dry-run` or `TRADING_DRY_RUN=true` calls
+   `order_margins()` for a margin
    preview only. The payload is field-whitelisted; `price` is omitted for
    MARKET orders. Banner reads `=== DRY RUN — margin preview only. NO order
    transmitted. ===`
 
 **A trade is only actually sent if all of these are true:**
 - `--yes` present
+- `TRADING_ALLOW_LIVE=true`
+- `TRADING_LIVE_ENABLED=true`
+- `TRADING_DRY_RUN=false`
+- Confirmation token matches when required
 - All 19 validation rules pass
 - Quantity ≤ `KITE_MAX_QUANTITY`
 - `--dry-run` NOT set
@@ -130,7 +146,7 @@ This CLI has four independent safety layers. An agent must respect all of them.
 |--------|-------|
 | General GETs | 10 req/s |
 | Historical data | 3 req/s |
-| Order placement | 10 req/s + 200/min + 3000–5000/day |
+| Order placement | 10 req/s + 200/min + 3000/day |
 | WebSocket connections | 3 per API key |
 | Subscribed instruments | 3000 per connection |
 
@@ -280,12 +296,15 @@ Fills for one order (multiple if partial).
   [--tag <STR>]              # auto-generated if omitted; used for idempotency
   [--dry-run]                # preview margin/charges, DO NOT transmit
   [--wait-for-fill <SEC>]    # poll until COMPLETE/REJECTED/CANCELLED
+  [--confirm-token <TOKEN>]  # required when configured
   --yes
 ```
 
 **Pipeline** on every invocation:
 1. Validate 19 rules locally. Reject on failure (no API call).
-2. If `--dry-run`: call `order_margins()` with whitelisted fields; print
+2. Enforce both environment live gates and the optional confirmation token.
+   If CLI or environment dry-run is active, call `order_margins()` with
+   whitelisted fields; print
    preview; return. `price` omitted for MARKET orders.
 3. Generate `tag` if omitted (14-char `KA` + random alphanumeric).
 4. `IdempotentOrderPlacer.place()`:
@@ -333,6 +352,15 @@ Returns: `order_id`, `tag`, all placement params, `final_status`,
 ```
 
 #### `cancel --order-id X --variety regular --yes`
+
+Requires the same environment and optional confirmation-token gates as
+placement. `modify`, GTT writes, alert writes, position conversion, and mutual
+fund writes use the identical centralized authorization check.
+
+#### `cancel-all --yes --confirm-panic`
+
+The distinct `--confirm-panic` acknowledgement is mandatory in addition to
+all normal live-write gates.
 Cancel by id.
 
 #### `modify --order-id X --variety regular --yes`

@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-07
+
+### Unreleased — live-write authorization and audit integrity
+
+- **Closed the direct-SDK write bypass**: every `kite_tool` trading write now
+  enforces `TRADING_ALLOW_LIVE`, `TRADING_LIVE_ENABLED`,
+  `TRADING_DRY_RUN`, the optional confirmation token, and the halt sentinel.
+  Environment dry-run forces `place` into margin preview and blocks all other
+  writes.
+- **Activated the engine confirmation gate**: the strategy CLI's
+  `--confirm-token` is now consumed before a live Kite engine connects.
+- **Audit outcomes**: broker order IDs and GTT/SIP/alert/group results propagate
+  into the final redacted NDJSON entry; confirmation secrets are excluded.
+- **GTT response integrity**: normalize Kite SDK create/modify responses to a
+  scalar trigger ID, fail closed on ambiguous post-mutation responses, and
+  prevent duplicate retries by directing operators to reconcile first.
+- **Session isolation**: `KITE_SESSION_PATH` now controls load, save, status,
+  logout, and authentication consistently through one resolver.
+- **MF diagnostics**: accounts without the `MF` capability receive an
+  actionable capability error instead of the SDK's low-level `NoneType`
+  parsing exception.
+- **Security/docs/tests**: `.env` is owner-only locally, safety documentation
+  now matches implementation and clearly separates local evidence from
+  regulated broker records, and regression coverage protects every corrected
+  path.
+
 ## 2026-04
 
 ### Unreleased — OAuth callback listener (remote login)

@@ -107,6 +107,14 @@ class Engine:
     # ----------------------------------------------------------------
 
     def _setup(self) -> None:
+        if self.config.broker == "kite":
+            # Validate the invocation-scoped confirmation token before even
+            # connecting.  ``confirm_token`` used to be accepted by the CLI
+            # but never consumed, leaving the documented second gate inert.
+            self.config.assert_order_authorized(
+                self.confirm_token,
+                action="start the live trading engine",
+            )
         self.broker.connect()
         self._md = MarketDataClient(
             self.broker,

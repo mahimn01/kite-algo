@@ -16,6 +16,16 @@ def parser():
     return build_parser()
 
 
+@pytest.fixture(autouse=True)
+def authorized_live_env(monkeypatch):
+    """Command-plumbing tests use fakes but must cross the real auth gate."""
+    monkeypatch.setenv("TRADING_DRY_RUN", "false")
+    monkeypatch.setenv("TRADING_ALLOW_LIVE", "true")
+    monkeypatch.setenv("TRADING_LIVE_ENABLED", "true")
+    monkeypatch.setenv("TRADING_CONFIRM_TOKEN_REQUIRED", "false")
+    monkeypatch.delenv("TRADING_ORDER_TOKEN", raising=False)
+
+
 class TestParserBuilds:
     def test_parser_constructs(self, parser) -> None:
         assert parser is not None
@@ -132,6 +142,96 @@ class TestSafetyGates:
         ])
         with pytest.raises(SystemExit, match="Refusing"):
             cmd_place(args)
+
+    def test_confirm_token_parses_on_write_commands(self, parser) -> None:
+        args = parser.parse_args([
+            "cancel", "--order-id", "123", "--yes",
+            "--confirm-token", "operator-token",
+        ])
+        assert args.confirm_token == "operator-token"
+
+    def test_live_write_requires_allow_live(
+        self, parser, monkeypatch,
+    ) -> None:
+        from kite_algo import kite_tool as kt
+        monkeypatch.setenv("TRADING_ALLOW_LIVE", "false")
+        monkeypatch.setattr(
+            kt, "_new_client",
+            lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+        args = parser.parse_args(["cancel", "--order-id", "123", "--yes"])
+        with pytest.raises(SystemExit, match="TRADING_ALLOW_LIVE=false"):
+            kt.cmd_cancel(args)
+
+    def test_live_write_requires_matching_confirmation_token(
+        self, parser, monkeypatch,
+    ) -> None:
+        from kite_algo import kite_tool as kt
+        monkeypatch.setenv("TRADING_CONFIRM_TOKEN_REQUIRED", "true")
+        monkeypatch.setenv("TRADING_ORDER_TOKEN", "EXPECTED")
+        monkeypatch.setattr(
+            kt, "_new_client",
+            lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+        args = parser.parse_args([
+            "cancel", "--order-id", "123", "--yes",
+            "--confirm-token", "WRONG",
+        ])
+        with pytest.raises(SystemExit, match="did not match"):
+            kt.cmd_cancel(args)
+
+    def test_matching_confirmation_token_reaches_fake_client(
+        self, parser, monkeypatch,
+    ) -> None:
+        from kite_algo import kite_tool as kt
+        monkeypatch.setenv("TRADING_CONFIRM_TOKEN_REQUIRED", "true")
+        monkeypatch.setenv("TRADING_ORDER_TOKEN", "EXPECTED")
+
+        class FakeClient:
+            def __init__(self):
+                self.cancelled = []
+            def cancel_order(self, **kwargs):
+                self.cancelled.append(kwargs)
+
+        client = FakeClient()
+        monkeypatch.setattr(kt, "_new_client", lambda: client)
+        args = parser.parse_args([
+            "cancel", "--order-id", "123", "--yes",
+            "--confirm-token", "EXPECTED",
+        ])
+        assert kt.cmd_cancel(args) == 0
+        assert client.cancelled == [{"variety": "regular", "order_id": "123"}]
+
+    def test_environment_dry_run_forces_margin_preview(
+        self, parser, monkeypatch,
+    ) -> None:
+        from kite_algo import kite_tool as kt
+        monkeypatch.setenv("TRADING_DRY_RUN", "true")
+
+        class FakeClient:
+            def __init__(self):
+                self.previewed = []
+            def order_margins(self, orders):
+                self.previewed.append(orders)
+                return [{"total": 123.45}]
+
+        client = FakeClient()
+        monkeypatch.setattr(kt, "_new_client", lambda: client)
+        monkeypatch.setattr(
+            kt, "IdempotentOrderPlacer",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("dry-run must not construct order placer")
+            ),
+        )
+        args = parser.parse_args([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "CNC", "--price", "1340",
+            "--yes", "--skip-market-rules",
+        ])
+        assert kt.cmd_place(args) == 0
+        assert len(client.previewed) == 1
+        assert args._audit_extra["dry_run"] is True
 
     def test_cancel_without_yes_raises(self, parser) -> None:
         from kite_algo.kite_tool import cmd_cancel
@@ -619,3 +719,62 @@ class TestMarketProtectionPlumbing:
         ])
         assert kt.cmd_place(args) == 0
         assert "market_protection" not in captured
+
+
+class TestAuditOutcomeIntegration:
+    def test_main_records_placed_order_id(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        import json
+        from kite_algo import kite_tool as kt
+
+        audit_dir = tmp_path / "audit"
+        monkeypatch.setenv("KITE_AUDIT_DIR", str(audit_dir))
+        monkeypatch.setenv("KITE_USER_ID", "U123")
+        monkeypatch.setattr(kt, "_new_client", lambda: object())
+
+        class FakePlacer:
+            def __init__(self, *a, **kw): pass
+            def place(self, **kwargs):
+                return "ORD_AUDITED"
+
+        monkeypatch.setattr(kt, "IdempotentOrderPlacer", FakePlacer)
+        rc = kt.main([
+            "place", "--exchange", "NSE", "--tradingsymbol", "RELIANCE",
+            "--transaction-type", "BUY", "--order-type", "LIMIT",
+            "--quantity", "1", "--product", "CNC", "--price", "1340",
+            "--yes", "--skip-market-rules",
+        ])
+        assert rc == 0
+
+        row = json.loads(next(audit_dir.glob("*.jsonl")).read_text())
+        assert row["kite_order_id"] == "ORD_AUDITED"
+        assert row["kite_user_id"] == "U123"
+        assert row["final_status"] == "SUBMITTED"
+
+    def test_confirmation_secret_is_not_persisted(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        import json
+        from kite_algo import kite_tool as kt
+
+        audit_dir = tmp_path / "audit"
+        monkeypatch.setenv("KITE_AUDIT_DIR", str(audit_dir))
+        monkeypatch.setenv("TRADING_CONFIRM_TOKEN_REQUIRED", "true")
+        monkeypatch.setenv("TRADING_ORDER_TOKEN", "TOP-SECRET-CONFIRM")
+
+        class FakeClient:
+            def cancel_order(self, **kwargs): pass
+
+        monkeypatch.setattr(kt, "_new_client", lambda: FakeClient())
+        rc = kt.main([
+            "cancel", "--order-id", "ORD_CANCEL", "--yes",
+            "--confirm-token", "TOP-SECRET-CONFIRM",
+        ])
+        assert rc == 0
+
+        raw = next(audit_dir.glob("*.jsonl")).read_text()
+        assert "TOP-SECRET-CONFIRM" not in raw
+        row = json.loads(raw)
+        assert row["args"]["confirm_token_present"] is True
+        assert row["kite_order_id"] == "ORD_CANCEL"

@@ -92,6 +92,36 @@ class TestRunOnce:
         assert len(pos) == 1
         assert pos[0].quantity == 1
 
+    def test_live_kite_engine_consumes_confirmation_token(self) -> None:
+        broker = MagicMock()
+        cfg = TradingConfig(
+            broker="kite",
+            dry_run=False,
+            allow_live=True,
+            live_enabled=True,
+            confirm_token_required=True,
+            order_token="EXPECTED",
+            kite=KiteConfig(
+                api_key="K", api_secret="S", access_token="T", user_id="U",
+            ),
+        )
+        engine = Engine(
+            broker=broker,
+            config=cfg,
+            strategy=_Strat([[]]),
+            risk=_lax_risk(),
+            confirm_token="WRONG",
+        )
+
+        with pytest.raises(SystemExit, match="did not match"):
+            engine.run_once()
+        broker.connect.assert_not_called()
+
+        engine.confirm_token = "EXPECTED"
+        engine.run_once()
+        broker.connect.assert_called_once()
+        broker.disconnect.assert_called_once()
+
     def test_persistence_logs_decision_and_order(self, tmp_path) -> None:
         db = tmp_path / "trading.sqlite"
         broker = SimBroker()

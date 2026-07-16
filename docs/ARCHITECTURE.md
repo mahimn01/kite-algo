@@ -4,19 +4,19 @@
 
 ```
 kite_algo/
-├── cli.py           # Main trading-engine CLI (scaffold)
+├── cli.py           # Main trading-engine CLI
 ├── kite_tool.py     # Comprehensive Kite data/ops CLI
 ├── config.py        # KiteConfig, TradingConfig, .env loader, session file I/O
 ├── instruments.py   # InstrumentSpec for NSE/BSE/NFO/BFO/MCX/CDS
 ├── orders.py        # TradeIntent + order validation
-├── engine.py        # Polling loop (stub)
-├── risk.py          # Risk limits (stub)
-├── oms.py           # Order manager (stub)
-├── persistence.py   # sqlite audit trail (stub)
+├── engine.py        # Polling strategy engine
+├── risk.py          # Portfolio/order risk limits
+├── oms.py           # Order manager + reconciliation
+├── persistence.py   # SQLite decision/order/status persistence
 ├── logging_setup.py
 └── broker/
     ├── base.py      # Broker protocol + OrderRequest/Position/MarketDataSnapshot/AccountSnapshot
-    ├── kite.py      # KiteBroker — live adapter (read path implemented, write path stubbed)
+    ├── kite.py      # KiteBroker — live read/write adapter
     └── sim.py       # SimBroker — deterministic simulator for tests/paper
 ```
 
@@ -44,7 +44,7 @@ refresh token. Our flow:
 2. CLI opens Kite's login URL and prompts for the `request_token` from the
    redirect
 3. Exchange with `generate_session(request_token, api_secret)` → `access_token`
-4. Write to `data/session.json` (gitignored)
+4. Write to `data/session.json` (gitignored), or `KITE_SESSION_PATH` when set
 5. All subsequent commands call `KiteConfig.from_env()` which reads the
    access token from the session file (or `KITE_ACCESS_TOKEN` env, if set)
 6. Session-using commands call `cfg.require_session()` which raises with a
@@ -52,15 +52,17 @@ refresh token. Our flow:
 
 ## Safety rails
 
-Two layers, mirrored from `trading-algo`:
+Defence in depth, mirrored from `trading-algo`:
 
 1. **Env gates**: `TRADING_ALLOW_LIVE`, `TRADING_LIVE_ENABLED`, `TRADING_DRY_RUN`
-2. **CLI gates**: every order-placing command requires `--yes`. The optional
+2. **CLI gates**: every write command requires `--yes`. The optional
    `--confirm-token` must match `TRADING_ORDER_TOKEN` if
    `TRADING_CONFIRM_TOKEN_REQUIRED=true`.
 
-`KiteBroker._require_live(action)` asserts both env gates before any write
-call reaches the Kite API.
+Both the direct `kite_tool` SDK path and `KiteBroker._require_live(action)`
+assert the environment gates before any write reaches Kite. The strategy
+engine consumes and validates its invocation-scoped confirmation token before
+connecting.
 
 ## Instruments cache
 

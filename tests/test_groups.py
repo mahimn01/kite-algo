@@ -170,6 +170,10 @@ class TestPlaceGroupWiring:
         from kite_algo import kite_tool as kt
         from kite_algo.kite_tool import cmd_group_start
 
+        monkeypatch.setenv("TRADING_DRY_RUN", "false")
+        monkeypatch.setenv("TRADING_ALLOW_LIVE", "true")
+        monkeypatch.setenv("TRADING_LIVE_ENABLED", "true")
+
         # Create a group first.
         g_args = parser.parse_args([
             "group-start", "--name", "X", "--format", "json",

@@ -3,9 +3,9 @@
 Rates are intentionally hardcoded and not env-tunable: they're regulatory
 inputs, not strategy knobs. Update them in one place when SEBI revises.
 
-Per-leg API: pass `(price, qty_units, side, lot_size)`. For futures,
-qty_units is contracts (lots) and notional = price * qty * lot_size. For
-ETF, lot_size=1 and qty_units = shares.
+Per-leg API: pass `(price, qty_units, side, lot_size)`. For futures and
+options, qty_units is contracts (lots) and notional = price * qty * lot_size
+(for options `price` is the premium). For ETF, lot_size=1 and qty_units = shares.
 """
 
 from __future__ import annotations
@@ -41,11 +41,6 @@ class IndianCostModel:
 
         if self.mode == "none":
             return CostBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        if self.mode == "options":
-            raise NotImplementedError(
-                "options cost model not yet implemented "
-                "(expected: STT 0.1% on premium sell, exchange 0.0353% on premium)"
-            )
 
         notional = price * qty_units * lot_size
         is_buy = side == "buy"
@@ -66,6 +61,16 @@ class IndianCostModel:
             stamp = 0.00015 * notional if is_buy else 0.0
             ipft = 0.000001 * notional
             dp_charge = 0.0 if is_buy else 15.93
+        elif self.mode == "options":
+            # Premium-based. STT 0.1% on the SELL leg only (post-Oct 2024),
+            # NSE exchange txn 0.03503% on premium per leg, stamp 0.003% on buy.
+            brokerage = 20.0
+            stt = 0.0 if is_buy else 0.001 * notional
+            exchange = 0.0003503 * notional
+            sebi = 0.000001 * notional
+            stamp = 0.00003 * notional if is_buy else 0.0
+            ipft = 0.000001 * notional
+            dp_charge = 0.0
         else:
             raise AssertionError(f"unreachable: mode={self.mode}")
 

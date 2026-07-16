@@ -192,6 +192,9 @@ class TestAlertsCli:
 
     def test_ato_requires_basket(self, parser, monkeypatch) -> None:
         from kite_algo import kite_tool as kt
+        monkeypatch.setenv("TRADING_DRY_RUN", "false")
+        monkeypatch.setenv("TRADING_ALLOW_LIVE", "true")
+        monkeypatch.setenv("TRADING_LIVE_ENABLED", "true")
         monkeypatch.setattr(kt, "_new_alerts_client", lambda: Mock())
         args = parser.parse_args([
             "alerts-create", "--name", "A", "--type", "ato",

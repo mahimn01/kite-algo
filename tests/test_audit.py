@@ -94,6 +94,21 @@ class TestRedaction:
         content = next(audit_root.glob("*.jsonl")).read_text()
         assert "SecretAbcdef1234567890XYZ" not in content
 
+    def test_redacts_sensitive_extra_fields(self, audit_root) -> None:
+        log_command(
+            cmd="place",
+            request_id="R-extra",
+            args={},
+            exit_code=0,
+            extra={"confirm_token": "operator-secret", "result": "ok"},
+            root=audit_root,
+        )
+        raw = next(audit_root.glob("*.jsonl")).read_text(encoding="utf-8")
+        assert "operator-secret" not in raw
+        row = json.loads(raw)
+        assert row["confirm_token"] == "***REDACTED***"
+        assert row["result"] == "ok"
+
 
 # -----------------------------------------------------------------------------
 # Concurrent appends (atomic under POSIX)
